@@ -60,3 +60,9 @@ tick direction is a fair coin, while Deriv pays ≈95 % on 50/50 contracts (brea
 engines therefore estimate P_model from walk-forward back-tests, shrink it toward the theoretical
 probability, and require statistical significance against break-even. Expect most rows to show
 negative EV most of the time; that is the honest output, not a bug.
+
+## Deploy
+
+`.github/workflows/deploy.yml` builds a static export (`next.config.ts` → `output: "export"`) and publishes it to
+GitHub Pages on every push to `main`. Enable it once under **Settings → Pages → Source: GitHub Actions**.
+GitHub Pages on a private repo requires a paid GitHub plan; on a free plan the repo must be public.
