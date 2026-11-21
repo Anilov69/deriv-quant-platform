@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+@theme inline {
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: #070b12;
+  color: #e2e8f0;
+}
+
+@utility panel {
+  @apply rounded-xl border border-slate-800 bg-slate-900/60 shadow-lg shadow-black/20 backdrop-blur;
+}
+@utility panel-title {
+  @apply flex items-center justify-between gap-2 border-b border-slate-800 px-4 py-2.5 text-sm font-semibold tracking-wide text-slate-200;
+}
+@utility label {
+  @apply text-[11px] font-medium uppercase tracking-wider text-slate-500;
+}
+@utility input {
+  @apply w-full rounded-md border border-slate-700 bg-slate-950 px-2.5 py-1.5 text-sm text-slate-100 outline-none focus:border-sky-500 focus:ring-1 focus:ring-sky-500/40;
+}
+@utility btn {
+  @apply inline-flex items-center justify-center gap-1.5 rounded-md px-3 py-1.5 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-40;
+}
+@utility btn-primary {
+  @apply btn bg-sky-600 text-white hover:bg-sky-500;
+}
+@utility btn-ghost {
+  @apply btn border border-slate-700 text-slate-200 hover:bg-slate-800;
+}
+@utility num {
+  @apply font-mono tabular-nums;
+}
