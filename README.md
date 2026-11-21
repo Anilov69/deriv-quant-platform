@@ -63,6 +63,7 @@ negative EV most of the time; that is the honest output, not a bug.
 
 ## Deploy
 
-`.github/workflows/deploy.yml` builds a static export (`next.config.ts` → `output: "export"`) and publishes it to
-GitHub Pages on every push to `main`. Enable it once under **Settings → Pages → Source: GitHub Actions**.
-GitHub Pages on a private repo requires a paid GitHub plan; on a free plan the repo must be public.
+`.github/workflows/deploy.yml` builds a static export (`next.config.ts` → `output: "export"`) on every push to
+`main` and pushes it to the `gh-pages` branch, served at https://anilov69.github.io/deriv-quant-platform/.
+GitHub Pages on a free plan requires the repo to be public. If Pages is not enabled automatically, set
+**Settings → Pages → Source: Deploy from a branch → gh-pages / (root)**.
