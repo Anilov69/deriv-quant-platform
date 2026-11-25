@@ -41,13 +41,14 @@ describe("ranking", () => {
   it("flags only quotes that clear the payout's break-even", () => {
     const candidates = buildCandidates({ family: "step", probabilities, currentDigit: 0, momentumZ: 0 });
     const quotes = new Map<string, { ask: number; payout: number }>();
-    // A digit-match payout near the real 8.93x can beat the model; a thin one cannot.
-    quotes.set(candidates[0].key, { ask: 1, payout: 8.93 });
-    quotes.set(candidates[1].key, { ask: 1, payout: 2.4 });
+    // Step candidates are Rise/Fall: a 2.40x payout beats a coin flip, 1.95x is
+    // Deriv's real margin and loses.
+    quotes.set(candidates[0].key, { ask: 1, payout: 2.4 });
+    quotes.set(candidates[1].key, { ask: 1, payout: 1.95 });
     const rows = rank(candidates, quotes);
     expect(rows).toHaveLength(2);
     expect(rows[0].value).toBe(true);
-    expect(rows[0].breakEven).toBeCloseTo(1 / 8.93, 10);
+    expect(rows[0].breakEven).toBeCloseTo(1 / 2.4, 10);
     expect(rows[1].value).toBe(false);
     expect(rows[0].edge).toBeGreaterThan(rows[1].edge);
   });

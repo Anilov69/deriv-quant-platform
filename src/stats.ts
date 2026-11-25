@@ -63,7 +63,9 @@ export function momentumZ(quotes: number[], halfLife = 60): number {
     variance += (quotes[index] - mean) * (quotes[index] - mean) * w;
   }
   const sigma = Math.sqrt(variance / weight);
-  if (!(sigma > 0)) return 0;
+  // A flat series leaves ~1e-16 of float residue; without a scale-aware guard
+  // that residue divided into an equally tiny numerator yields a fake z of ~1.
+  if (!(sigma > 1e-12 * Math.max(1, Math.abs(mean)))) return 0;
   return (quotes[quotes.length - 1] - mean) / sigma;
 }
 

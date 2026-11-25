@@ -26,9 +26,11 @@ describe("digit extraction", () => {
 });
 
 describe("recency-weighted posterior", () => {
-  it("weights the newest tick most heavily", () => {
-    const counts = weightedDigitCounts([1, 1, 1, 7], 10);
-    expect(counts[7]).toBeGreaterThan(counts[1]);
+  it("gives the newest tick full weight and older ticks less", () => {
+    const counts = weightedDigitCounts([9, 0], 10);
+    expect(counts[0]).toBeCloseTo(1, 10);
+    expect(counts[9]).toBeLessThan(1);
+    expect(counts[9]).toBeGreaterThan(0);
   });
 
   it("always normalises to one", () => {
