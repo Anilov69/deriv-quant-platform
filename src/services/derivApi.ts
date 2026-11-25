@@ -488,7 +488,8 @@ export class DerivClient {
     return {
       id: String(value.id),
       contractType,
-      symbol: String(request.symbol ?? value.symbol ?? ""),
+      // We send "underlying_symbol"; accept the legacy key for older responses.
+      symbol: String(request.underlying_symbol ?? request.symbol ?? value.symbol ?? ""),
       barrier: request.barrier === undefined ? undefined : String(request.barrier),
       duration: safeNumber(request.duration, 1),
       durationUnit: "t",
