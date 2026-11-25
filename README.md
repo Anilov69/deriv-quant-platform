@@ -46,6 +46,6 @@ The exported site is written to `out/`.
 
 ## Deployment
 
-`.github/workflows/deploy.yml` installs dependencies, runs the tests, builds with `PAGES_BASE_PATH=/deriv-quant-platform`, and publishes `out/` to the `gh-pages` branch.
+`.github/workflows/deploy.yml` installs dependencies, runs the tests, builds with `PAGES_BASE_PATH=/deriv-quant-platform`, and publishes `out/` to the `gh-pages` branch. It runs on every push to `main` and can also be started manually from the Actions tab.
 
 Production URL: https://anilov69.github.io/deriv-quant-platform/
