@@ -12,7 +12,7 @@ export interface DerivClientEvents {
   status: ConnectionStatus;
   authorized: { loginId: string; name: string };
   accounts: DerivAccount[];
-  balance: { currency: string; balance: number; loginId: string };
+  balance: { currency: string; balance: number; loginId: string; kind: DerivAccount["kind"] };
   symbols: MarketSymbol[];
   history: { symbol: string; ticks: Tick[] };
   tick: Tick & { symbol: string };
@@ -61,7 +61,22 @@ interface ContractPayload {
   buy_price?: number | string;
 }
 
-const DEFAULT_APP_ID = "1089";
+interface OptionsAccount {
+  account_id: string;
+  account_type: DerivAccount["kind"];
+  balance: number;
+  currency: string;
+  group: string;
+  status: "active" | "inactive";
+}
+
+interface AuthenticatedSession {
+  accounts: DerivAccount[];
+  account: DerivAccount;
+  endpoint: string;
+}
+
+const API_BASE_URL = "https://api.derivws.com";
 const MAX_TICKS = 1_000;
 const MAX_SUBSCRIPTIONS = 12;
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -110,8 +125,7 @@ function uniqueTicks(ticks: Tick[]): Tick[] {
 export class DerivClient {
   private socket: WebSocket | null = null;
   private token = "";
-  private appId = DEFAULT_APP_ID;
-  private endpoint = "";
+  private appId = "";
   private status: ConnectionStatus = "disconnected";
   private pending = new Map<number, PendingRequest>();
   private pendingBuys = new Map<number, Proposal>();
@@ -124,6 +138,7 @@ export class DerivClient {
   private intentionalClose = true;
   private lastProposalRequestAt = 0;
   private activeLoginId = "";
+  private activeAccountKind: DerivAccount["kind"] = "demo";
   private selectedTickSymbol = "";
   private tickCache = new Map<string, Tick[]>();
   private symbolMetadataCache = new Map<string, { decimals: number; pip: number }>();
@@ -160,59 +175,174 @@ export class DerivClient {
     this.emit("status", status);
   }
 
-  async connect(token: string, appId = DEFAULT_APP_ID): Promise<void> {
+  async connect(token: string, appId: string): Promise<void> {
     const cleanToken = token.trim();
+    const cleanAppId = appId.trim();
     if (!cleanToken) throw new DerivApiError("InvalidToken", "Enter a Deriv Personal Access Token.");
+    if (!/^\d+$/.test(cleanAppId)) throw new DerivApiError("InvalidAppId", "Enter the numeric App ID from your Deriv PAT application.");
+    if (cleanAppId === "1089") throw new DerivApiError("LegacyAppId", "App ID 1089 is a legacy registry ID. Create a new PAT application at developers.deriv.com and use its App ID.");
     this.disconnect();
     this.token = cleanToken;
-    this.appId = /^\d+$/.test(appId.trim()) ? appId.trim() : DEFAULT_APP_ID;
-    this.endpoint = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(this.appId)}&l=EN&brand=deriv`;
+    this.appId = cleanAppId;
     this.intentionalClose = false;
     this.reconnectAttempt = 0;
     try {
-      await this.openAndAuthorize();
+      await this.openAndAuthorize(true);
     } catch (error) {
       this.clearCredentials();
       throw error;
     }
   }
 
-  private async openAndAuthorize(): Promise<void> {
-    this.setStatus(this.reconnectAttempt > 0 ? "reconnecting" : "connecting");
-    const socket = new WebSocket(this.endpoint);
-    this.socket = socket;
+  private async apiRequest<T>(path: string, init?: RequestInit): Promise<T> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const response = await fetch(`${API_BASE_URL}${path}`, {
+        ...init,
+        cache: "no-store",
+        credentials: "omit",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${this.token}`,
+          "Deriv-App-ID": this.appId,
+          ...init?.headers,
+        },
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => null) as Record<string, unknown> | null;
+      if (!response.ok) {
+        const errors = payload?.errors as Array<{ code?: string; message?: string }> | undefined;
+        const first = errors?.[0];
+        const message = redactSecret(first?.message ?? `Deriv request failed with HTTP ${response.status}.`, this.token);
+        throw new DerivApiError(first?.code ?? `Http${response.status}`, message);
+      }
+      if (!payload) throw new DerivApiError("InvalidResponse", "Deriv returned an unreadable REST response.");
+      return payload as T;
+    } catch (error) {
+      if (error instanceof DerivApiError) throw error;
+      if (controller.signal.aborted) throw new DerivApiError("RequestTimeout", "Deriv did not respond before the request timed out.");
+      throw new DerivApiError("RequestFailed", "Could not reach Deriv. Check the network and try again.");
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 
+  private async loadAccounts(): Promise<DerivAccount[]> {
+    const payload = await this.apiRequest<{ data?: unknown[] }>("/trading/v1/options/accounts");
+    if (!Array.isArray(payload.data)) throw new DerivApiError("InvalidResponse", "Deriv did not return an account list.");
+    const accounts = payload.data.flatMap((value): DerivAccount[] => {
+      if (!value || typeof value !== "object") return [];
+      const account = value as Partial<OptionsAccount>;
+      if (!account.account_id || !/^[A-Z0-9_-]{1,64}$/i.test(account.account_id)) return [];
+      if (account.account_type !== "demo" && account.account_type !== "real") return [];
+      if (account.status !== "active") return [];
+      return [{
+        loginid: account.account_id,
+        currency: String(account.currency ?? "USD").toUpperCase(),
+        kind: account.account_type,
+        name: `${account.account_type === "demo" ? "Demo" : "Real"} ${account.account_id}`,
+      }];
+    });
+    if (!accounts.length) throw new DerivApiError("NoAccounts", "This PAT has no Options trading accounts.");
+    return accounts;
+  }
+
+  private async createAuthenticatedSession(requestedLoginId?: string): Promise<AuthenticatedSession> {
+    const accounts = await this.loadAccounts();
+    const activeAccounts = accounts.filter((account) => account.loginid !== "" && account.kind);
+    const account = requestedLoginId
+      ? activeAccounts.find((item) => item.loginid === requestedLoginId)
+      : activeAccounts.find((item) => item.kind === "demo") ?? activeAccounts[0];
+    if (!account) throw new DerivApiError("AccountUnavailable", "The selected Deriv account is not active.");
+    const payload = await this.apiRequest<{ data?: { url?: unknown } }>(`/trading/v1/options/accounts/${encodeURIComponent(account.loginid)}/otp`, { method: "POST" });
+    const endpoint = this.validateOtpUrl(payload.data?.url, account.kind);
+    return { accounts, account, endpoint };
+  }
+
+  private validateOtpUrl(value: unknown, kind: DerivAccount["kind"]): string {
+    let url: URL;
+    try {
+      url = new URL(String(value ?? ""));
+    } catch {
+      throw new DerivApiError("InvalidOtpResponse", "Deriv returned an invalid WebSocket URL.");
+    }
+    const expectedPath = `/trading/v1/options/ws/${kind}`;
+    if (url.protocol !== "wss:" || url.hostname !== "api.derivws.com" || url.port || url.username || url.password || url.pathname !== expectedPath || !url.searchParams.get("otp")) {
+      throw new DerivApiError("InvalidOtpResponse", "Deriv returned an invalid WebSocket URL.");
+    }
+    return url.toString();
+  }
+
+  private closeCurrentSocket(): void {
+    const socket = this.socket;
+    this.socket = null;
+    if (socket) {
+      socket.onopen = null;
+      socket.onerror = null;
+      socket.onclose = null;
+      socket.onmessage = null;
+      socket.close(1000, "Client reconnect");
+    }
+    this.stopPing();
+    this.rejectAllPending(new DerivApiError("Disconnected", "The Deriv connection closed."));
+    this.subscriptions.clear();
+  }
+
+  private async openWebSocket(endpoint: string): Promise<void> {
+    const socket = new WebSocket(endpoint);
+    this.socket = socket;
     await new Promise<void>((resolve, reject) => {
       const openedAt = performance.now();
+      let settled = false;
+      const fail = (error: DerivApiError) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(openTimer);
+        reject(error);
+      };
       const openTimer = setTimeout(() => {
+        fail(new DerivApiError("ConnectionTimeout", "Deriv did not accept the WebSocket connection."));
         socket.close();
-        reject(new DerivApiError("ConnectionTimeout", "Deriv did not accept the WebSocket connection."));
       }, REQUEST_TIMEOUT_MS);
-
       socket.onopen = () => {
+        if (settled) return;
+        settled = true;
         clearTimeout(openTimer);
         this.startPing();
-        this.setStatus("connected");
         this.emit("latency", Math.max(1, Math.round(performance.now() - openedAt)));
         resolve();
       };
-      socket.onerror = () => {
-        clearTimeout(openTimer);
-        reject(new DerivApiError("ConnectionFailed", "Could not reach Deriv. Check the network and try again."));
+      socket.onerror = () => fail(new DerivApiError("ConnectionFailed", "Could not reach Deriv. Check the network and try again."));
+      socket.onclose = () => {
+        if (!settled) fail(new DerivApiError("ConnectionFailed", "Could not reach Deriv. Check the network and try again."));
+        else this.handleClose(socket);
       };
-      socket.onclose = () => this.handleClose(socket);
       socket.onmessage = (event) => this.handleMessage(event.data);
     });
+  }
 
-    const response = await this.send({ authorize: this.token });
-    const authorize = response.authorize as { loginid?: string; fullname?: string; account_list?: unknown[] } | undefined;
-    if (!authorize?.loginid) throw new DerivApiError("AuthorizationFailed", "Deriv did not return an authorized account.");
-    this.activeLoginId = authorize.loginid;
-    this.emit("authorized", { loginId: authorize.loginid, name: authorize.fullname ?? authorize.loginid });
-    await this.send({ account_list: 1 });
-    await this.loadActiveSymbols();
-    await this.subscribeBalance();
-    if (this.selectedTickSymbol) await this.subscribeTicks(this.selectedTickSymbol);
+  private async openAndAuthorize(announce: boolean, requestedLoginId?: string): Promise<void> {
+    this.closeCurrentSocket();
+    this.setStatus(this.reconnectAttempt > 0 ? "reconnecting" : "connecting");
+    const session = await this.createAuthenticatedSession(requestedLoginId);
+    await this.openWebSocket(session.endpoint);
+    this.activeLoginId = session.account.loginid;
+    this.activeAccountKind = session.account.kind;
+    try {
+      await this.loadActiveSymbols();
+      await this.subscribeBalance();
+      if (this.selectedTickSymbol) await this.subscribeTicks(this.selectedTickSymbol);
+    } catch (error) {
+      this.closeCurrentSocket();
+      throw error;
+    }
+    if (announce) {
+      this.emit("accounts", session.accounts);
+      this.emit("authorized", { loginId: session.account.loginid, name: session.account.name });
+    }
+    this.reconnectAttempt = 0;
+    this.setStatus("connected");
   }
 
   private startPing(): void {
@@ -257,7 +387,7 @@ export class DerivClient {
     this.setStatus("reconnecting");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.openAndAuthorize().catch(() => this.scheduleReconnect());
+      void this.openAndAuthorize(false, this.activeLoginId).catch(() => this.scheduleReconnect());
     }, delay);
   }
 
@@ -270,6 +400,7 @@ export class DerivClient {
     this.subscriptions.clear();
     this.selectedTickSymbol = "";
     this.activeLoginId = "";
+    this.activeAccountKind = "demo";
     const socket = this.socket;
     this.socket = null;
     socket?.close(1000, "Client disconnect");
@@ -279,7 +410,7 @@ export class DerivClient {
   clearCredentials(): void {
     this.disconnect();
     this.token = "";
-    this.endpoint = "";
+    this.appId = "";
     this.contractMeta.clear();
     this.pendingBuys.clear();
     this.tickCache.clear();
@@ -368,6 +499,7 @@ export class DerivClient {
           currency: String(balance.currency ?? "USD"),
           balance: safeNumber(balance.balance),
           loginId: String(balance.loginid ?? this.activeLoginId),
+          kind: this.activeAccountKind,
         });
       }
     } else if (message.msg_type === "active_symbols") {
@@ -403,7 +535,7 @@ export class DerivClient {
           this.contractMeta.set(contractId, {
             proposal,
             mode: "live",
-            accountKind: proposal.symbol ? (this.activeLoginId.startsWith("VRTC") ? "demo" : "real") : "demo",
+            accountKind: this.activeAccountKind,
           });
           this.emit("bought", { contractId, proposal, buyPrice: safeNumber(buy.buy_price, proposal.askPrice) });
           void this.subscribeContract(contractId).catch(() => undefined);
@@ -539,14 +671,22 @@ export class DerivClient {
   }
 
   async switchAccount(loginId: string): Promise<void> {
-    if (!/^[A-Z0-9]+$/.test(loginId)) throw new DerivApiError("InvalidAccount", "The selected Deriv account is invalid.");
+    if (!/^[A-Z0-9_-]{1,64}$/i.test(loginId)) throw new DerivApiError("InvalidAccount", "The selected Deriv account is invalid.");
+    if (loginId === this.activeLoginId && this.connected) return;
+    const previousLoginId = this.activeLoginId;
     await this.clearProposals();
-    const response = await this.send({ authorize: this.token, account: loginId });
-    const authorize = response.authorize as { loginid?: string } | undefined;
-    if (authorize?.loginid !== loginId) throw new DerivApiError("AccountSwitchFailed", "Deriv did not switch to the selected account.");
-    this.activeLoginId = loginId;
-    await this.unsubscribe("balance");
-    await this.subscribeBalance();
+    try {
+      await this.openAndAuthorize(true, loginId);
+    } catch (error) {
+      if (previousLoginId) {
+        try {
+          await this.openAndAuthorize(false, previousLoginId);
+        } catch {
+          this.setStatus("error");
+        }
+      }
+      throw error;
+    }
   }
 
   async subscribeTicks(symbol: string): Promise<void> {

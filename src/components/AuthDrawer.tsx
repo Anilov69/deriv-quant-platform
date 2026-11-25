@@ -11,7 +11,7 @@ export function AuthDrawer({ platform }: { platform: QuantPlatform }) {
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (!token.trim()) return;
+    if (!token.trim() || !appId.trim()) return;
     try {
       await platform.connect(token, appId);
       setToken("");
@@ -29,12 +29,12 @@ export function AuthDrawer({ platform }: { platform: QuantPlatform }) {
           <button aria-label="Close authentication" onClick={() => platform.setAuthOpen(false)} className="rounded-lg p-2 text-slate-400 hover:bg-white/5 hover:text-white"><X size={18} /></button>
         </div>
         <h2 id="auth-title" className="mt-6 text-xl font-semibold text-white">Connect your Deriv account</h2>
-        <p className="mt-2 text-sm leading-6 text-slate-400">The token is sent directly to Deriv over WebSocket and held in memory for this tab only.</p>
+        <p className="mt-2 text-sm leading-6 text-slate-400">The token is sent directly to Deriv for account discovery and a one-time WebSocket session. It stays in memory for this tab only.</p>
 
         <div className="mt-6 space-y-3 rounded-xl border border-emerald-400/15 bg-emerald-400/[0.04] p-4 text-xs leading-5 text-slate-300">
           <div className="flex items-center gap-2 font-semibold text-emerald-300"><LockKeyhole size={14} /> Session-only credential handling</div>
-          <p>No localStorage, cookies, server requests, analytics, or console logging contain your PAT. Closing or refreshing the tab clears access.</p>
-          <p>Create a token with <span className="font-mono text-slate-200">read</span> and <span className="font-mono text-slate-200">trade</span> scopes in your Deriv API dashboard.</p>
+          <p>No app server, localStorage, cookies, analytics, or console logging contain your PAT. Closing or refreshing the tab clears access.</p>
+          <p>Create a new PAT application with <span className="font-mono text-slate-200">read</span> and <span className="font-mono text-slate-200">trade</span> scopes at <a className="text-cyan-300 underline" href="https://developers.deriv.com" target="_blank" rel="noreferrer">developers.deriv.com</a>. Legacy registry App IDs, including 1089, do not work with the Options API.</p>
         </div>
 
         <form onSubmit={submit} className="mt-7 space-y-5">
@@ -53,18 +53,19 @@ export function AuthDrawer({ platform }: { platform: QuantPlatform }) {
             />
           </label>
           <label className="block text-xs font-medium text-slate-300">
-            App ID <span className="font-normal text-slate-500">(optional)</span>
+            Options API App ID
             <input
               type="text"
               inputMode="numeric"
-              pattern="[0-9]*"
+              pattern="[0-9]+"
+              required
               value={appId}
               onChange={(event) => setAppId(event.target.value.replace(/\D/g, ""))}
-              placeholder="Default registry app"
+              placeholder="New PAT application ID"
               className="mt-2 w-full rounded-lg border border-white/15 bg-slate-950/70 px-3 py-3 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-cyan-400/60 focus:ring-2 focus:ring-cyan-400/10"
             />
           </label>
-          <button disabled={platform.authBusy || !token.trim()} type="submit" className="w-full rounded-lg bg-cyan-400 px-4 py-3 text-sm font-bold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40">
+          <button disabled={platform.authBusy || !token.trim() || !appId.trim()} type="submit" className="w-full rounded-lg bg-cyan-400 px-4 py-3 text-sm font-bold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-40">
             {platform.authBusy ? "Authorizing with Deriv…" : "Authorize & connect"}
           </button>
         </form>
