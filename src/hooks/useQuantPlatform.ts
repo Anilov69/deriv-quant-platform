@@ -309,7 +309,7 @@ export function useQuantPlatform() {
         let quote = last.quote;
         if (family === "continuous") quote += (random() - 0.5) * 0.18 + Math.sin(Date.now() / 30_000) * 0.01;
         else if (family === "step") quote += random() < 0.5 ? 0.09 : 0.11;
-        else quote += (random() < 0.025 ? (random() < 0.5 ? -1.4 : 1.4) : (random() - 0.5) * 0.08);
+        else quote += random() < 0.025 ? (random() < 0.5 ? -1.4 : 1.4) : (random() - 0.5) * 0.08;
         quote = Number(quote.toFixed(3));
         return appendTick(current, { epoch: Date.now(), quote, digit: tickDigits(quote) });
       });
@@ -449,7 +449,7 @@ export function useQuantPlatform() {
     for (const trade of settledTrades) {
       cumulative += trade.profit;
       peak = Math.max(peak, cumulative);
-      maxDrawdown = Math.max(maxDrawdown, peak - maxDrawdown);
+      maxDrawdown = Math.max(maxDrawdown, peak - cumulative);
       curve.push(Number(cumulative.toFixed(2)));
     }
     const wins = settledTrades.filter((trade) => trade.profit > 0).length;
