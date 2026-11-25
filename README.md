@@ -1,51 +1,89 @@
 # Deriv Quant Platform
 
-A Next.js 15 App Router workspace for synthetic-index analytics, payout-aware signals, risk previews, and guarded trade execution. The dashboard runs in deterministic simulation mode by default and can connect directly to Deriv through the browser WebSocket API.
+100% client-side quantitative workspace for Deriv synthetic indices — volatility (continuous), step, and jump families.
+Built with Vite + React + TypeScript + Tailwind CSS and deployed to GitHub Pages. No backend, no server-side secrets.
 
-## Run locally
+**Live:** https://anilov69.github.io/deriv-quant-platform/
 
-```bash
-npm ci
-npm run dev
+## Why the connection layer looks like this
+
+Earlier builds shipped `wss://ws.derivws.com/websockets/v3?app_id=...` plus a `{"authorize": token}` frame.
+Deriv's current platform rejects personal access tokens and alphanumeric App IDs on that path, so this app uses the
+REST + OTP handshake instead:
+
+```
+1. GET  https://api.derivws.com/trading/v1/options/accounts
+        Authorization: Bearer <PAT>
+        Deriv-App-ID: <ALPHANUMERIC_APP_ID>
+   -> demo/real account list
+
+2. POST https://api.derivws.com/trading/v1/options/accounts/{accountId}/otp
+   -> { data: { url: "wss://api.derivws.com/trading/v1/options/ws/demo?otp=..." } }
+
+3. new WebSocket(url)      // already authenticated: no authorize frame, no app_id query string
 ```
 
-The development server runs at `http://127.0.0.1:3100`.
+OTP URLs are single-use and short-lived, so switching accounts (or reconnecting) requests a fresh one.
+The accounts endpoint answers CORS preflights for this origin, which is what keeps the app fully static.
+
+### Credentials
+
+* PAT + App ID are entered in the Connection drawer and sent only to Deriv.
+* Default storage: `sessionStorage` (cleared when the tab closes). Opt in to `localStorage` with "Remember on this device".
+* No token is bundled, committed, logged, or proxied. "Disconnect & return to simulation" wipes stored credentials.
+
+## Markets and analytics
+
+| Family | Symbols | Analysis |
+| --- | --- | --- |
+| Continuous | `R_10/25/50/75/100`, `1HZ10V/25V/50V/75V/100V` | Digit frequency over 100/300/1000 ticks, z-scores, Shannon entropy, repeat rate, lag-1 autocorrelation, log return and realised volatility, Bollinger z-score, velocity deceleration |
+| Step | `stpRNG`, `stpRNG2..` | First-order transition matrix and counts, observed step sizes, low-probability barrier detection, neighbour probability, streak length and direction, mean-reversion score |
+| Jump | `JD10/25/50/75/100` | ATR, detected jump magnitudes, jump intensity, hazard rate, ticks since last jump, stabilisation flag, micro-drift |
+
+Signals are converted into ticket-level proposals (`proposal` subscription) and are only actionable when the model
+probability clears the payout-implied break-even probability quoted by Deriv. Contract types wired today:
+`DIGITMATCH`, `DIGITDIFF`, `CALL`, `PUT` with 1–10 tick durations.
+
+## Risk controls
+
+* Fractional Kelly sizing and stake progression preview (`src/risk/martingale.ts`).
+* Daily stop-loss / take-profit, max consecutive losses, kill switch, emergency stop.
+* Real-account orders always require explicit confirmation; auto-trade is hard-disabled on real accounts.
+* Session starts in a clearly marked simulation mode with a 10,000 unit paper balance.
+
+## Development
 
 ```bash
-npm test
+npm install
+npm run dev        # http://127.0.0.1:3100
 npm run typecheck
-npm run build
+npm test
+npm run build      # -> dist/
 ```
 
-For the GitHub Pages static export, set the repository base path before building:
-
-```bash
-PAGES_BASE_PATH=/deriv-quant-platform npm run build
-```
-
-The exported site is written to `out/`.
-
-## Deriv connection and credentials
-
-- Simulation mode is the default and does not require a token.
-- Live mode asks for a Deriv personal access token and an optional App ID; the default App ID is `1089`.
-- The token is held only in the `DerivClient` instance's memory and is sent directly to `wss://ws.derivws.com/websockets/v3`.
-- The token is not written to `localStorage`, cookies, server requests, analytics, or logs. Authorization errors redact it, and `clearCredentials()` removes it from the client.
-- Real-account trades require explicit confirmation. Automatic trading is disabled on real accounts.
-
-## Source layout
-
-- `src/app/` - App Router shell, metadata, and global styles
-- `src/components/` - dashboard, chart, signal, execution, analytics, and trade UI
-- `src/engines/` - continuous, step, and jump analysis engines
-- `src/hooks/useQuantPlatform.ts` - client state, simulation, live subscriptions, and trade flow
-- `src/risk/martingale.ts` - EV, Kelly, progression, and kill-switch calculations
-- `src/services/derivApi.ts` - authenticated Deriv WebSocket client
-- `src/types/index.ts` - shared domain types
-- `tests/` - Vitest coverage for engines, risk math, and API boundaries
+`vite.config.ts` uses `base: "./"`, so `dist/` can be served from any subpath, including `/<repo>/` on GitHub Pages.
 
 ## Deployment
 
-`.github/workflows/deploy.yml` installs dependencies, runs the tests, builds with `PAGES_BASE_PATH=/deriv-quant-platform`, and publishes `out/` to the `gh-pages` branch. It runs on every push to `main` and can also be started manually from the Actions tab.
+`.github/workflows/deploy.yml` runs on every push to `main`: install → typecheck → tests → build → publish `dist/`
+to the `gh-pages` branch, which GitHub Pages serves. No secrets are required beyond the default `GITHUB_TOKEN`.
 
-Production URL: https://anilov69.github.io/deriv-quant-platform/
+## Project layout
+
+```
+src/services/derivRest.ts       REST + OTP transport (accounts, single-use socket URLs)
+src/services/derivApi.ts        WebSocket session: ticks, proposals, buys, contract tracking, reconnect
+src/services/credentialStore.ts session/local credential persistence
+src/engines/{continuous,step,jump}.ts   per-family statistics and signal construction
+src/hooks/useQuantPlatform.ts   orchestration: data, signals, execution, risk, toasts
+src/components/*                dashboard, heatmaps, matrices, chart, execution and risk panels
+tests/*                         boundaries for the API layer and the statistical engines
+```
+
+## Notes and limits
+
+* Synthetic-index outcomes are generated by Deriv's RNG; statistical edges are estimates, not guarantees. Payouts
+  embed a house margin, so a signal only has positive expectation when the model probability beats break-even.
+* The UI currently exposes four contract types; Touch/No-Touch, Ends In/Out, Stays In/Goes Out and Over/Under
+  contracts are not yet wired to the proposal builder.
+* Everything runs in the browser, so nothing survives a cache wipe — re-enter credentials after clearing storage.

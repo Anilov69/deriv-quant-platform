@@ -7,6 +7,7 @@ import type {
   Tick,
   TradeRecord,
 } from "@/types";
+import { fetchDerivAccounts, isValidAppId, requestDerivOtp } from "@/services/derivRest";
 
 export interface DerivClientEvents {
   status: ConnectionStatus;
@@ -61,7 +62,6 @@ interface ContractPayload {
   buy_price?: number | string;
 }
 
-const DEFAULT_APP_ID = "1089";
 const MAX_TICKS = 1_000;
 const MAX_SUBSCRIPTIONS = 12;
 const REQUEST_TIMEOUT_MS = 12_000;
@@ -110,8 +110,8 @@ function uniqueTicks(ticks: Tick[]): Tick[] {
 export class DerivClient {
   private socket: WebSocket | null = null;
   private token = "";
-  private appId = DEFAULT_APP_ID;
-  private endpoint = "";
+  private appId = "";
+  private socketUrl = "";
   private status: ConnectionStatus = "disconnected";
   private pending = new Map<number, PendingRequest>();
   private pendingBuys = new Map<number, Proposal>();
@@ -124,6 +124,7 @@ export class DerivClient {
   private intentionalClose = true;
   private lastProposalRequestAt = 0;
   private activeLoginId = "";
+  private accountsCache: DerivAccount[] = [];
   private selectedTickSymbol = "";
   private tickCache = new Map<string, Tick[]>();
   private symbolMetadataCache = new Map<string, { decimals: number; pip: number }>();
@@ -160,26 +161,41 @@ export class DerivClient {
     this.emit("status", status);
   }
 
-  async connect(token: string, appId = DEFAULT_APP_ID): Promise<void> {
+  async connect(token: string, appId: string): Promise<void> {
     const cleanToken = token.trim();
+    const cleanAppId = appId.trim();
     if (!cleanToken) throw new DerivApiError("InvalidToken", "Enter a Deriv Personal Access Token.");
+    if (!isValidAppId(cleanAppId)) {
+      throw new DerivApiError("InvalidAppId", "Enter your Deriv App ID. Letters and numbers are both accepted.");
+    }
     this.disconnect();
     this.token = cleanToken;
-    this.appId = /^\d+$/.test(appId.trim()) ? appId.trim() : DEFAULT_APP_ID;
-    this.endpoint = `wss://ws.derivws.com/websockets/v3?app_id=${encodeURIComponent(this.appId)}&l=EN&brand=deriv`;
+    this.appId = cleanAppId;
     this.intentionalClose = false;
     this.reconnectAttempt = 0;
     try {
-      await this.openAndAuthorize();
+      const accounts = await fetchDerivAccounts({ token: this.token, appId: this.appId });
+      if (!accounts.length) throw new DerivApiError("NoAccounts", "This token has no Options accounts available.");
+      this.accountsCache = accounts;
+      this.emit("accounts", accounts);
+      const preferred = accounts.find((item) => item.kind === "demo") ?? accounts[0];
+      await this.openAccount(preferred);
     } catch (error) {
       this.clearCredentials();
       throw error;
     }
   }
 
+  private async openAccount(account: DerivAccount): Promise<void> {
+    this.socketUrl = await requestDerivOtp({ token: this.token, appId: this.appId }, account.loginid);
+    this.activeLoginId = account.loginid;
+    await this.openAndAuthorize();
+    this.emit("authorized", { loginId: account.loginid, name: account.name });
+  }
+
   private async openAndAuthorize(): Promise<void> {
     this.setStatus(this.reconnectAttempt > 0 ? "reconnecting" : "connecting");
-    const socket = new WebSocket(this.endpoint);
+    const socket = new WebSocket(this.socketUrl);
     this.socket = socket;
 
     await new Promise<void>((resolve, reject) => {
@@ -204,12 +220,6 @@ export class DerivClient {
       socket.onmessage = (event) => this.handleMessage(event.data);
     });
 
-    const response = await this.send({ authorize: this.token });
-    const authorize = response.authorize as { loginid?: string; fullname?: string; account_list?: unknown[] } | undefined;
-    if (!authorize?.loginid) throw new DerivApiError("AuthorizationFailed", "Deriv did not return an authorized account.");
-    this.activeLoginId = authorize.loginid;
-    this.emit("authorized", { loginId: authorize.loginid, name: authorize.fullname ?? authorize.loginid });
-    await this.send({ account_list: 1 });
     await this.loadActiveSymbols();
     await this.subscribeBalance();
     if (this.selectedTickSymbol) await this.subscribeTicks(this.selectedTickSymbol);
@@ -257,7 +267,15 @@ export class DerivClient {
     this.setStatus("reconnecting");
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      void this.openAndAuthorize().catch(() => this.scheduleReconnect());
+      const account = this.accountsCache.find((item) => item.loginid === this.activeLoginId);
+      if (!account) {
+        this.intentionalClose = true;
+        this.setStatus("error");
+        return;
+      }
+      void this.openAccount(account)
+        .then(() => { this.reconnectAttempt = 0; })
+        .catch(() => this.scheduleReconnect());
     }, delay);
   }
 
@@ -279,7 +297,8 @@ export class DerivClient {
   clearCredentials(): void {
     this.disconnect();
     this.token = "";
-    this.endpoint = "";
+    this.socketUrl = "";
+    this.accountsCache = [];
     this.contractMeta.clear();
     this.pendingBuys.clear();
     this.tickCache.clear();
@@ -539,14 +558,20 @@ export class DerivClient {
   }
 
   async switchAccount(loginId: string): Promise<void> {
-    if (!/^[A-Z0-9]+$/.test(loginId)) throw new DerivApiError("InvalidAccount", "The selected Deriv account is invalid.");
+    const account = this.accountsCache.find((item) => item.loginid === loginId);
+    if (!account) throw new DerivApiError("InvalidAccount", "The selected Deriv account is not available for this token.");
     await this.clearProposals();
-    const response = await this.send({ authorize: this.token, account: loginId });
-    const authorize = response.authorize as { loginid?: string } | undefined;
-    if (authorize?.loginid !== loginId) throw new DerivApiError("AccountSwitchFailed", "Deriv did not switch to the selected account.");
-    this.activeLoginId = loginId;
-    await this.unsubscribe("balance");
-    await this.subscribeBalance();
+    // An OTP authorises exactly one socket, so switching accounts means a fresh OTP + socket.
+    this.intentionalClose = true;
+    this.stopPing();
+    this.subscriptions.clear();
+    this.rejectAllPending(new DerivApiError("Switching", "Switching Deriv account."));
+    const previous = this.socket;
+    this.socket = null;
+    previous?.close(1000, "Account switch");
+    this.intentionalClose = false;
+    this.reconnectAttempt = 0;
+    await this.openAccount(account);
   }
 
   async subscribeTicks(symbol: string): Promise<void> {

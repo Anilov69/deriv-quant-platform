@@ -5,6 +5,7 @@ import { analyzeContinuous } from "@/engines/continuous";
 import { analyzeJump } from "@/engines/jump";
 import { analyzeStep } from "@/engines/step";
 import { calculateEv, evaluateKillSwitches, nextStake, progressionPreview } from "@/risk/martingale";
+import { clearStoredCredentials, loadStoredCredentials, saveCredentials } from "@/services/credentialStore";
 import { DerivClient, familyForSymbol, type DerivClientEvents } from "@/services/derivApi";
 import type {
   ConnectionStatus,
@@ -473,11 +474,12 @@ export function useQuantPlatform() {
     setAutoTrade(false);
   }, [symbols]);
 
-  const connect = useCallback(async (token: string, appId: string) => {
+  const connect = useCallback(async (token: string, appId: string, remember = false) => {
     setAuthBusy(true);
     try {
       if (!clientRef.current) throw new Error("The trading client is not ready.");
       await clientRef.current.connect(token, appId);
+      saveCredentials({ token: token.trim(), appId: appId.trim(), remember });
       setAuthOpen(false);
       setStartBalance(10_000);
       setBalance(10_000);
@@ -489,6 +491,16 @@ export function useQuantPlatform() {
       setAuthBusy(false);
     }
   }, [pushToast]);
+
+  const restoreAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    if (restoreAttemptedRef.current) return;
+    restoreAttemptedRef.current = true;
+    const stored = loadStoredCredentials();
+    if (!stored) return;
+    void connect(stored.token, stored.appId, stored.remember).catch(() => undefined);
+  }, [connect]);
 
   const switchAccount = useCallback(async (loginId: string) => {
     if (!clientRef.current || mode !== "live") return;
@@ -512,6 +524,7 @@ export function useQuantPlatform() {
   }, [accounts, mode, pushToast, risk.baseStake]);
 
   const startSimulation = useCallback(() => {
+    clearStoredCredentials();
     clientRef.current?.clearCredentials();
     setMode("simulation");
     setStatus("disconnected");

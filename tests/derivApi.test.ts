@@ -1,14 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DerivClient, familyForSymbol, redactSecret, type DerivClientEvents } from "../src/services/derivApi";
+import { isValidAppId } from "../src/services/derivRest";
 import type { Proposal } from "../src/types";
+
+const ACCOUNTS = [
+  { account_id: "VRTC900001", currency: "USD", account_type: "demo", account_name: "Demo account" },
+  { account_id: "CR900001", currency: "USD", account_type: "real", account_name: "Real account" },
+];
 
 class MockWebSocket {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
+  static readonly CLOSING = 2;
   static readonly CLOSED = 3;
   static instances: MockWebSocket[] = [];
-  static failAuthorization = false;
-  static currentLoginId = "VRTC100";
+  static currentLoginId = "VRTC900001";
 
   readyState = MockWebSocket.CONNECTING;
   onopen: ((event: Event) => void) | null = null;
@@ -31,30 +37,7 @@ class MockWebSocket {
     const reqId = request.req_id;
     let response: Record<string, unknown>;
 
-    if (request.authorize) {
-      if (!MockWebSocket.failAuthorization) MockWebSocket.currentLoginId = String(request.account ?? "VRTC100");
-      response = MockWebSocket.failAuthorization
-        ? { error: { code: "InvalidToken", message: `Rejected ${String(request.authorize)}` } }
-        : {
-          msg_type: "authorize",
-          authorize: {
-            loginid: String(request.account ?? "VRTC100"),
-            fullname: "Test account",
-            account_list: [
-              { loginid: "VRTC100", currency: "USD", account_name: "Demo" },
-              { loginid: "CR100", currency: "USD", account_name: "Real" },
-            ],
-          },
-        };
-    } else if (request.account_list) {
-      response = {
-        msg_type: "account_list",
-        account_list: [
-          { loginid: "VRTC100", currency: "USD", account_name: "Demo" },
-          { loginid: "CR100", currency: "USD", account_name: "Real" },
-        ],
-      };
-    } else if (request.active_symbols) {
+    if (request.active_symbols) {
       response = {
         msg_type: "active_symbols",
         active_symbols: [
@@ -88,13 +71,23 @@ class MockWebSocket {
     queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ ...response, req_id: reqId }) } as MessageEvent));
   }
 
-  close(): void {
+  close(_code?: number, _reason?: string): void {
     this.readyState = MockWebSocket.CLOSED;
     this.onclose?.({ type: "close" } as CloseEvent);
   }
 }
 
+function response(body: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => JSON.stringify(body),
+  } as unknown as Response;
+}
+
 const clients: DerivClient[] = [];
+const otpAccounts: string[] = [];
+let fetchMock: ReturnType<typeof vi.fn>;
 
 function eventOnce<K extends keyof DerivClientEvents>(client: DerivClient, event: K): Promise<DerivClientEvents[K]> {
   return new Promise((resolve) => {
@@ -107,9 +100,23 @@ function eventOnce<K extends keyof DerivClientEvents>(client: DerivClient, event
 
 beforeEach(() => {
   MockWebSocket.instances = [];
-  MockWebSocket.failAuthorization = false;
-  MockWebSocket.currentLoginId = "VRTC100";
+  MockWebSocket.currentLoginId = "VRTC900001";
+  otpAccounts.length = 0;
+  fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = String(input);
+    if (url === "https://api.derivws.com/trading/v1/options/accounts") return response({ data: ACCOUNTS });
+    const otp = /\/accounts\/([^/]+)\/otp$/.exec(url);
+    if (otp) {
+      expect(init?.method).toBe("POST");
+      const accountId = decodeURIComponent(otp[1]);
+      otpAccounts.push(accountId);
+      const mode = accountId === "CR900001" ? "real" : "demo";
+      return response({ data: { url: `wss://api.derivws.com/trading/v1/options/ws/${mode}?otp=${otpAccounts.length}` } });
+    }
+    return response({ message: "unexpected request" }, 404);
+  });
   vi.stubGlobal("WebSocket", MockWebSocket);
+  vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
@@ -118,7 +125,13 @@ afterEach(() => {
 });
 
 describe("Deriv API boundaries", () => {
-  it("allows only the requested synthetic-index families", () => {
+  it("accepts alphanumeric App IDs and rejects malformed ones", () => {
+    expect(isValidAppId("12aBc34")).toBe(true);
+    expect(isValidAppId("1234")).toBe(true);
+    expect(isValidAppId("my-app_01")).toBe(true);
+    expect(isValidAppId("bad id!")).toBe(false);
+    expect(isValidAppId("")).toBe(false);
+
     for (const symbol of ["R_10", "R_100", "1HZ50V", "stpRNG", "stpRNG2", "stpRNG12", "JD100"]) {
       expect(familyForSymbol(symbol)).not.toBeNull();
     }
@@ -128,7 +141,7 @@ describe("Deriv API boundaries", () => {
     expect(redactSecret("token abc123 failed", "abc123")).toBe("token [redacted] failed");
   });
 
-  it("authorizes, loads accounts and supported symbols, and resolves the balance stream", async () => {
+  it("fetches accounts over REST, opens the OTP socket, and never sends an authorize frame", async () => {
     const client = new DerivClient();
     clients.push(client);
     const authorized = eventOnce(client, "authorized");
@@ -136,9 +149,9 @@ describe("Deriv API boundaries", () => {
     const symbols = eventOnce(client, "symbols");
     const balance = eventOnce(client, "balance");
 
-    await client.connect("test-token", "1234");
+    await client.connect("test-token", "12aBc34");
 
-    await expect(authorized).resolves.toEqual({ loginId: "VRTC100", name: "Test account" });
+    await expect(authorized).resolves.toEqual({ loginId: "VRTC900001", name: "Demo account" });
     await expect(accounts).resolves.toHaveLength(2);
     await expect(symbols).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ symbol: "R_100", family: "continuous" }),
@@ -146,15 +159,30 @@ describe("Deriv API boundaries", () => {
       expect.objectContaining({ symbol: "JD10", family: "jump" }),
     ]));
     expect((await symbols).some((item) => item.symbol === "EURUSD")).toBe(false);
-    await expect(balance).resolves.toEqual({ currency: "USD", balance: 1000, loginId: "VRTC100" });
-    expect(MockWebSocket.instances[0].url).toContain("app_id=1234");
+    await expect(balance).resolves.toEqual({ currency: "USD", balance: 1000, loginId: "VRTC900001" });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.derivws.com/trading/v1/options/accounts");
+    const headers = init.headers as Record<string, string>;
+    expect(headers.Authorization).toBe("Bearer test-token");
+    expect(headers["Deriv-App-ID"]).toBe("12aBc34");
+    expect(MockWebSocket.instances[0].url).toContain("wss://api.derivws.com/trading/v1/options/ws/demo?otp=");
+    expect(MockWebSocket.instances[0].sent.some((request) => "authorize" in request)).toBe(false);
   });
 
-  it("clears credentials and redacts the token when authorization fails", async () => {
-    MockWebSocket.failAuthorization = true;
+  it("rejects a malformed App ID before touching the network", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await expect(client.connect("secret-token")).rejects.toThrow("Rejected [redacted]");
+    await expect(client.connect("test-token", "bad id!")).rejects.toThrow(/App ID/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  it("surfaces a 401 from Deriv and clears credentials", async () => {
+    fetchMock.mockImplementationOnce(async () => response({ message: "Missing authorization header" }, 401));
+    const client = new DerivClient();
+    clients.push(client);
+    await expect(client.connect("bad-token", "12aBc34")).rejects.toThrow(/401/);
     expect((client as unknown as { token: string }).token).toBe("");
     expect(client.connected).toBe(false);
   });
@@ -162,7 +190,7 @@ describe("Deriv API boundaries", () => {
   it("parses a live proposal, buys that exact quote, and tracks its contract", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await client.connect("test-token");
+    await client.connect("test-token", "12aBc34");
     const proposalEvent = eventOnce(client, "proposal");
     await client.subscribeProposal({ symbol: "R_100", contractType: "DIGITMATCH", barrier: "5", duration: 1, amount: 1, currency: "USD" });
     const proposal = await proposalEvent;
@@ -178,7 +206,7 @@ describe("Deriv API boundaries", () => {
   it("rejects stale proposals before sending a purchase", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await client.connect("test-token");
+    await client.connect("test-token", "12aBc34");
     const stale: Proposal = {
       id: "stale", contractType: "CALL", symbol: "R_100", duration: 3, durationUnit: "t",
       askPrice: 1, payout: 1.95, spot: 100, currency: "USD", receivedAt: Date.now() - 5_000,
@@ -187,13 +215,17 @@ describe("Deriv API boundaries", () => {
     expect(MockWebSocket.instances[0].sent.some((request) => request.buy)).toBe(false);
   });
 
-  it("selects and verifies the requested account before resubscribing balance", async () => {
+  it("switches accounts by requesting a fresh OTP socket", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await client.connect("test-token");
+    await client.connect("test-token", "12aBc34");
     const balance = eventOnce(client, "balance");
-    await client.switchAccount("CR100");
-    expect(MockWebSocket.instances[0].sent.some((request) => request.authorize && request.account === "CR100")).toBe(true);
-    expect((await balance).loginId).toBe("CR100");
+    await client.switchAccount("CR900001");
+
+    expect(otpAccounts).toEqual(["VRTC900001", "CR900001"]);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toContain("/ws/real?otp=");
+    expect(MockWebSocket.instances[1].sent.some((request) => "authorize" in request)).toBe(false);
+    expect((await balance).loginId).toBe("CR900001");
   });
 });
