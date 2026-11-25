@@ -1,126 +1,84 @@
 "use client";
-import { CONTRACT_LABEL } from "@/lib/markets";
-import type { SignalRow } from "@/lib/signals";
-import { pct, signed } from "@/lib/format";
-import { guardrailBlock, requoteNow } from "@/services/session";
-import { currentAccount, useStore, type Guardrails } from "@/store/useStore";
-import type { EngineSettings } from "@/engines/types";
 
-function Num({ label, value, onChange, step = 1, min = 0, suffix }: { label: string; value: number; onChange: (v: number) => void; step?: number; min?: number; suffix?: string }) {
+import { Bot, CircleDollarSign, Play, Settings2, ShieldAlert, Square, TrendingUp } from "lucide-react";
+import type { QuantPlatform } from "@/hooks/useQuantPlatform";
+import type { RiskSettings } from "@/types";
+
+export function ExecutionPanel({ platform, onExecute }: { platform: QuantPlatform; onExecute: () => void }) {
+  const real = platform.account.kind === "real";
+  const patchRisk = (patch: Partial<RiskSettings>) => platform.updateRisk(patch);
+  const progressionMultiplier = platform.ev ? 1 + 1 / platform.ev.payoutPercentage : platform.risk.multiplier;
   return (
-    <label className="block">
-      <span className="label">{label}</span>
-      <div className="mt-0.5 flex items-center gap-1">
-        <input
-          type="number"
-          className="input num !py-1"
-          value={value}
-          step={step}
-          min={min}
-          onChange={(e) => {
-            const v = Number(e.target.value);
-            if (Number.isFinite(v) && v >= min) onChange(v);
-          }}
-        />
-        {suffix && <span className="text-xs text-slate-500">{suffix}</span>}
+    <section className="rounded-xl border border-white/10 bg-[#0d1522] p-4">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-slate-400"><Settings2 size={14} /> Execution & risk</div>
+        <div className="font-mono text-xs text-cyan-200">{platform.account.currency} {platform.stake.toFixed(2)} <span className="text-[9px] text-slate-500">NEXT STAKE</span></div>
       </div>
-    </label>
+
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <NumberField label="Base stake" value={platform.risk.baseStake} min={0.35} step={0.01} onChange={(value) => patchRisk({ baseStake: value })} />
+        <NumberField label="Kelly fraction" value={platform.risk.kellyFraction} min={0.01} max={0.25} step={0.01} onChange={(value) => patchRisk({ kellyFraction: value })} />
+        <NumberField label="Daily stop-loss" value={platform.risk.dailyStopLoss} min={1} step={1} onChange={(value) => patchRisk({ dailyStopLoss: value })} />
+        <NumberField label="Daily take-profit" value={platform.risk.dailyTakeProfit} min={1} step={1} onChange={(value) => patchRisk({ dailyTakeProfit: value })} />
+      </div>
+
+      <div className="mt-4 rounded-lg border border-white/10 bg-slate-950/40 p-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <div className="text-xs font-medium text-slate-200">Martingale progression</div>
+            <div className="mt-1 text-[10px] text-slate-500">OFF uses flat / fractional-Kelly sizing</div>
+          </div>
+          <button aria-label="Toggle Martingale" aria-pressed={platform.risk.martingale} onClick={() => patchRisk({ martingale: !platform.risk.martingale })} className={`relative h-6 w-11 rounded-full transition ${platform.risk.martingale ? "bg-amber-400" : "bg-slate-700"}`}>
+            <span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition-all ${platform.risk.martingale ? "left-6" : "left-1"}`} />
+          </button>
+        </div>
+        <div className={`mt-3 grid grid-cols-3 gap-2 transition ${platform.risk.martingale ? "opacity-100" : "pointer-events-none opacity-35"}`}>
+          <div><div className="text-[10px] uppercase tracking-wider text-slate-500">Payout multiplier</div><div className="mt-1.5 rounded-md border border-white/10 bg-slate-950/60 px-2.5 py-2 font-mono text-xs text-amber-200">{progressionMultiplier.toFixed(3)}×</div></div>
+          <NumberField label="Max step" value={platform.risk.maxStep} min={1} max={12} step={1} onChange={(value) => patchRisk({ maxStep: value })} />
+          <NumberField label="Loss limit" value={platform.risk.maxConsecutiveLosses} min={1} max={20} step={1} onChange={(value) => patchRisk({ maxConsecutiveLosses: value })} />
+        </div>
+        <label className="mt-3 block text-[10px] uppercase tracking-wider text-slate-500">
+          Progression mode
+          <select value={platform.risk.mode} onChange={(event) => patchRisk({ mode: event.target.value as RiskSettings["mode"] })} className="mt-1.5 w-full rounded-md border border-white/10 bg-slate-950 px-2 py-2 text-xs normal-case tracking-normal text-slate-200 outline-none">
+            <option value="next-signal">Immediate next signal</option>
+            <option value="classic-immediate">Classic immediate</option>
+          </select>
+        </label>
+      </div>
+
+      <div className="mt-4">
+        <div className="mb-2 flex items-center justify-between text-[10px] uppercase tracking-wider text-slate-500"><span>Progression preview</span><span>P(loss) = pₗₒₛₛⁿ</span></div>
+        <div className="max-h-36 overflow-auto rounded-lg border border-white/[0.07]">
+          <table className="w-full text-right font-mono text-[10px]">
+            <thead className="sticky top-0 bg-slate-950 text-[9px] text-slate-500"><tr><th className="px-2 py-2 text-left">STEP</th><th className="px-2 py-2">STAKE</th><th className="px-2 py-2">CUM. CAP</th><th className="px-2 py-2">MAX LOSS</th></tr></thead>
+            <tbody className="divide-y divide-white/[0.05] text-slate-300">
+              {platform.progression.slice(0, 7).map((row) => <tr key={row.step}><td className="px-2 py-1.5 text-left text-slate-500">{row.step}</td><td className="px-2 py-1.5">{row.stake.toFixed(2)}</td><td className="px-2 py-1.5">{row.cumulativeCapital.toFixed(2)}</td><td className="px-2 py-1.5 text-rose-300">{(row.probabilityOfLoss * 100).toFixed(2)}%</td></tr>)}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className={`mt-4 flex items-center justify-between rounded-lg border p-3 ${real ? "border-amber-400/30 bg-amber-400/[0.06]" : "border-white/10 bg-white/[0.02]"}`}>
+        <div className="flex items-center gap-2"><Bot size={17} className={platform.autoTrade ? "text-emerald-400" : "text-slate-500"} /><div><div className="text-xs font-medium text-slate-200">Auto-trade</div><div className="text-[10px] text-slate-500">{real ? "Manual confirmation only" : "Positive-EV signals · 1.5s interval"}</div></div></div>
+        <button aria-label="Toggle auto trade" aria-pressed={platform.autoTrade} disabled={real || platform.emergencyStop} onClick={() => platform.setAutoTrade(!platform.autoTrade)} className={`relative h-6 w-11 rounded-full transition disabled:opacity-30 ${platform.autoTrade ? "bg-emerald-400" : "bg-slate-700"}`}><span className={`absolute top-1 h-4 w-4 rounded-full bg-white transition-all ${platform.autoTrade ? "left-6" : "left-1"}`} /></button>
+      </div>
+
+      {real && <div className="mt-3 flex gap-2 rounded-lg border border-amber-400/25 bg-amber-400/[0.06] p-3 text-[10px] leading-4 text-amber-200"><ShieldAlert size={15} className="shrink-0" />REAL ACCOUNT: every purchase opens a confirmation showing symbol, contract, stake, payout, and EV.</div>}
+
+      <button onClick={onExecute} disabled={!platform.canTrade || platform.openPositions >= 3} className="mt-4 flex w-full items-center justify-center gap-2 rounded-lg bg-cyan-400 px-4 py-3 text-sm font-bold text-slate-950 transition hover:bg-cyan-300 disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-500">
+        {platform.autoTrade ? <Square size={15} /> : platform.openPositions >= 3 ? <CircleDollarSign size={16} /> : <Play size={15} fill="currentColor" />}
+        {platform.autoTrade ? "AUTO-TRADE RUNNING" : platform.openPositions >= 3 ? "POSITION LIMIT REACHED" : real ? "REVIEW REAL TRADE" : "EXECUTE SELECTED SIGNAL"}
+      </button>
+      <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500"><span className="flex items-center gap-1"><TrendingUp size={11} /> {platform.consecutiveLosses} consecutive losses</span><span>{platform.openPositions} open / 3 max</span></div>
+    </section>
   );
 }
 
-export function ExecutionPanel({ best, onExecute }: { best: SignalRow | null; onExecute: (r: SignalRow, auto: boolean) => void }) {
-  const s = useStore();
-  const g = s.guardrails;
-  const st = s.settings;
-  const acct = currentAccount(s);
-  const block = guardrailBlock();
-  const setG = (p: Partial<Guardrails>) => s.set({ guardrails: { ...g, ...p } });
-  const setS = (p: Partial<EngineSettings>, requote = false) => {
-    s.set({ settings: { ...st, ...p } });
-    if (requote) requoteNow();
-  };
-  const mine = s.trades.filter((t) => t.accountId === s.accountId && t.profit !== undefined && t.status !== "open");
-  const pnl = mine.reduce((a, t) => a + (t.profit ?? 0), 0);
-
+function NumberField({ label, value, min, max, step, onChange }: { label: string; value: number; min?: number; max?: number; step?: number; onChange: (value: number) => void }) {
   return (
-    <div className={`panel ${acct?.account_type === "real" ? "!border-red-500/60" : ""}`}>
-      <div className="panel-title">
-        <span>Execution & risk guardrails</span>
-        <span className={`text-xs font-normal ${pnl >= 0 ? "text-emerald-400" : "text-red-400"}`}>Session P&L {signed(pnl)} {s.currency}</span>
-      </div>
-      <div className="space-y-4 p-4">
-        <div className={`rounded-lg border p-3 ${best ? "border-emerald-500/60 bg-emerald-950/30" : "border-slate-800 bg-slate-950/40"}`} data-testid="recommendation">
-          <div className="label">Recommended trade</div>
-          {best ? (
-            <div className="mt-1 text-sm">
-              <div className="font-semibold text-emerald-300">
-                {CONTRACT_LABEL[best.contractType]} {best.barrier ?? ""} · {best.duration} ticks
-              </div>
-              <div className="num mt-0.5 text-xs text-slate-300">
-                P_model {pct(best.pModel, 2)} vs P_be {pct(best.pBe, 2)} · EV {signed(best.evPerStake * 100)}% · stake {best.kellyStake.toFixed(2)} {s.currency}
-              </div>
-            </div>
-          ) : (
-            <p className="mt-1 text-xs text-slate-400">No contract currently passes the EV filter. This is the normal state: Deriv&apos;s payouts are priced below fair odds.</p>
-          )}
-          <button className="btn-primary mt-3 w-full" disabled={!best || !!block || s.busy} onClick={() => best && onExecute(best, false)} data-testid="execute-recommended">
-            {s.busy ? "Placing order…" : "Execute recommended trade"}
-          </button>
-          {block && <p className="mt-1.5 text-[11px] text-amber-300">⛔ {block}</p>}
-        </div>
-
-        <label className="flex items-center justify-between gap-3 rounded-lg border border-slate-800 px-3 py-2">
-          <div>
-            <div className="text-sm font-semibold">Semi-auto mode</div>
-            <div className="text-[11px] text-slate-500">Auto-executes actionable signals, one at a time, within the guardrails below.</div>
-          </div>
-          <input
-            type="checkbox"
-            className="h-5 w-5 accent-sky-500"
-            checked={s.autoMode}
-            disabled={!!block && !s.autoMode}
-            onChange={(e) => s.set({ autoMode: e.target.checked })}
-            data-testid="auto-mode"
-          />
-        </label>
-
-        <div className="grid grid-cols-2 gap-3">
-          <Num label="Max daily loss" value={g.maxDailyLoss} onChange={(v) => setG({ maxDailyLoss: v })} suffix={s.currency} />
-          <Num label="Max consecutive losses" value={g.maxConsecutiveLosses} onChange={(v) => setG({ maxConsecutiveLosses: Math.max(1, Math.round(v)) })} min={1} />
-          <Num label="Minimum EV" value={+(g.minEv * 100).toFixed(2)} step={0.5} onChange={(v) => setG({ minEv: v / 100 })} suffix="%" />
-          <Num label="Max risk / trade" value={g.maxRiskPct} step={0.5} onChange={(v) => setG({ maxRiskPct: v })} suffix="%" />
-          <Num label="Kelly multiplier" value={g.kellyMultiplier} step={0.05} onChange={(v) => setG({ kellyMultiplier: Math.min(1, v) })} />
-          <Num label="Min sample (n)" value={g.minSample} onChange={(v) => setG({ minSample: Math.round(v) })} />
-          <Num label="Min edge Z" value={g.minEdgeZ} step={0.1} onChange={(v) => setG({ minEdgeZ: v })} />
-          <Num label="Quote / manual stake" value={g.quoteStake} step={1} min={0.35} onChange={(v) => setG({ quoteStake: v })} suffix={s.currency} />
-        </div>
-
-        <details className="rounded-lg border border-slate-800 px-3 py-2">
-          <summary className="cursor-pointer text-sm font-semibold">Engine parameters</summary>
-          <div className="mt-3 grid grid-cols-2 gap-3">
-            <Num label="Digit window" value={st.digitWindow} onChange={(v) => setS({ digitWindow: Math.min(1000, Math.max(20, Math.round(v))) })} />
-            <Num label="Prior strength α" value={st.priorStrength} onChange={(v) => setS({ priorStrength: Math.round(v) })} />
-            <Num label="Digit duration (t)" value={st.digitDuration} min={1} onChange={(v) => setS({ digitDuration: Math.min(10, Math.max(1, Math.round(v))) }, true)} />
-            <label className="block">
-              <span className="label">Rise/Fall durations</span>
-              <input
-                className="input num mt-0.5 !py-1"
-                defaultValue={st.riseFallDurations.join(",")}
-                onBlur={(e) => {
-                  const d = [...new Set(e.target.value.split(",").map((x) => Math.round(Number(x))).filter((x) => x >= 1 && x <= 10))].sort((a, b) => a - b);
-                  if (d.length) setS({ riseFallDurations: d }, true);
-                }}
-              />
-            </label>
-            <Num label="Bollinger N" value={st.bollingerN} min={5} onChange={(v) => setS({ bollingerN: Math.round(v) })} />
-            <Num label="Exhaustion |Z|" value={st.bollingerZ} step={0.1} onChange={(v) => setS({ bollingerZ: v })} />
-            <Num label="Min streak k" value={st.minStreak} min={2} onChange={(v) => setS({ minStreak: Math.round(v) })} />
-            <Num label="Jump k × ATR₂₀" value={st.jumpAtrMultiple} step={0.5} onChange={(v) => setS({ jumpAtrMultiple: v })} />
-            <Num label="Prior λ (jumps/h)" value={+(st.jumpLambda * 3600).toFixed(2)} step={0.5} onChange={(v) => setS({ jumpLambda: Math.max(0.01, v) / 3600 })} />
-            <Num label="Jump hazard block" value={+(st.jumpHazardBlock * 100).toFixed(3)} step={0.1} onChange={(v) => setS({ jumpHazardBlock: v / 100 })} suffix="%" />
-          </div>
-        </details>
-      </div>
-    </div>
+    <label className="block text-[10px] uppercase tracking-wider text-slate-500">
+      {label}
+      <input type="number" value={value} min={min} max={max} step={step} onChange={(event) => { const next = Number(event.target.value); if (Number.isFinite(next)) onChange(next); }} className="mt-1.5 w-full rounded-md border border-white/10 bg-slate-950/60 px-2.5 py-2 font-mono text-xs normal-case tracking-normal text-slate-200 outline-none focus:border-cyan-400/50" />
+    </label>
   );
 }
