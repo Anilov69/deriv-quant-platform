@@ -31,6 +31,11 @@ class MockWebSocket {
     });
   }
 
+  /** Each OTP URL targets one account, so the mock derives the login from the socket path. */
+  get loginId(): string {
+    return this.url.includes("/ws/real") ? "CR900001" : "VRTC900001";
+  }
+
   send(raw: string): void {
     const request = JSON.parse(raw) as Record<string, unknown>;
     this.sent.push(request);
@@ -49,7 +54,7 @@ class MockWebSocket {
         ],
       };
     } else if (request.balance) {
-      response = { msg_type: "balance", balance: { balance: 1000, currency: "USD", loginid: MockWebSocket.currentLoginId } };
+      response = { msg_type: "balance", balance: { balance: 1000, currency: "USD", loginid: this.loginId } };
     } else if (request.proposal) {
       response = {
         msg_type: "proposal",
