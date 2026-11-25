@@ -26,6 +26,16 @@ REST + OTP handshake instead:
 OTP URLs are single-use and short-lived, so switching accounts (or reconnecting) requests a fresh one.
 The accounts endpoint answers CORS preflights for this origin, which is what keeps the app fully static.
 
+**New API field names are not the Legacy ones.** Requests and responses were verified against the live public socket
+(`wss://api.derivws.com/trading/v1/options/ws/public`):
+
+* `proposal` requires `underlying_symbol`; sending Legacy `symbol` fails with *field is not allowed*.
+* `active_symbols` returns `underlying_symbol`, `underlying_symbol_name` and `pip_size` — and sending the removed
+  `product_type` filter fails with *Input validation failed: product_type*.
+* `ticks` still takes a plain symbol string, but its payload carries `pip_size` (2 for `R_100`), so digits are read at
+  the quote's real precision rather than a hardcoded 3 decimals.
+* `POST …/otp` accepts **no body and no `Content-Type`** header.
+
 ### Credentials
 
 * PAT + App ID are entered in the Connection drawer and sent only to Deriv.
@@ -37,7 +47,7 @@ The accounts endpoint answers CORS preflights for this origin, which is what kee
 | Family | Symbols | Analysis |
 | --- | --- | --- |
 | Continuous | `R_10/25/50/75/100`, `1HZ10V/25V/50V/75V/100V` | Digit frequency over 100/300/1000 ticks, z-scores, Shannon entropy, repeat rate, lag-1 autocorrelation, log return and realised volatility, Bollinger z-score, velocity deceleration |
-| Step | `stpRNG`, `stpRNG2..` | First-order transition matrix and counts, observed step sizes, low-probability barrier detection, neighbour probability, streak length and direction, mean-reversion score |
+| Step | `stpRNG`, `stpRNG2..5` | First-order transition matrix and counts, observed step sizes, low-probability barrier detection, neighbour probability, streak length and direction, mean-reversion score. **Deriv quotes no digit contracts on step indices** — only CALL/PUT — so digit statistics are analytics only and no digit proposal is ever requested for this family |
 | Jump | `JD10/25/50/75/100` | ATR, detected jump magnitudes, jump intensity, hazard rate, ticks since last jump, stabilisation flag, micro-drift |
 
 Signals are converted into ticket-level proposals (`proposal` subscription) and are only actionable when the model

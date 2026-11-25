@@ -445,7 +445,7 @@ export class DerivClient {
     const cached = this.symbolMetadataCache.get(symbol);
     if (cached) return cached;
     const match = /^(?:R|JD)(10|25|50|75|100)$/.exec(symbol);
-    const metadata = { decimals: 3, pip: match ? 10 ** -Number(match[1]) : 0.001 };
+    const metadata = { decimals: 2, pip: match ? 10 ** -Number(match[1]) : 0.01 };
     this.symbolMetadataCache.set(symbol, metadata);
     return metadata;
   }
@@ -459,15 +459,16 @@ export class DerivClient {
   private filterSymbols(active: Record<string, unknown>[]): MarketSymbol[] {
     const result: MarketSymbol[] = [];
     for (const item of active) {
-      const symbol = String(item.symbol ?? "");
+      // New Options API names: underlying_symbol / underlying_symbol_name / pip_size.
+      const symbol = String(item.underlying_symbol ?? item.symbol ?? "");
       const family = familyForSymbol(symbol);
       if (!family) continue;
-      const pip = safeNumber(item.pip, 0.001);
-      const decimals = pip > 0 ? Math.min(8, Math.max(0, Math.round(-Math.log10(pip)))) : 3;
+      const pip = safeNumber(item.pip_size ?? item.pip, 0.01);
+      const decimals = pip > 0 ? Math.min(8, Math.max(0, Math.round(-Math.log10(pip)))) : 2;
       this.symbolMetadataCache.set(symbol, { decimals, pip });
       result.push({
         symbol,
-        displayName: String(item.display_name ?? symbol),
+        displayName: String(item.underlying_symbol_name ?? item.display_name ?? symbol),
         family,
         decimals,
         pip,
@@ -547,7 +548,8 @@ export class DerivClient {
   }
 
   async loadActiveSymbols(): Promise<MarketSymbol[]> {
-    const response = await this.send({ active_symbols: "brief", product_type: "basic" });
+    // product_type is a removed Legacy filter and now fails validation.
+    const response = await this.send({ active_symbols: "brief" });
     const symbols = this.filterSymbols((response.active_symbols as Record<string, unknown>[] | undefined) ?? []);
     this.emit("symbols", symbols);
     return symbols;
@@ -600,6 +602,10 @@ export class DerivClient {
     if (!this.connected) throw new DerivApiError("NotConnected", "Connect to Deriv first.");
     if (!Number.isInteger(input.duration) || input.duration < 1 || input.duration > 10) throw new DerivApiError("InvalidDuration", "Duration must be between 1 and 10 ticks.");
     if (!Number.isFinite(input.amount) || input.amount <= 0) throw new DerivApiError("InvalidStake", "Stake must be greater than zero.");
+    // Deriv offers no digit contracts on step indices; only CALL/PUT are tradable there.
+    if (familyForSymbol(input.symbol) === "step" && input.contractType.startsWith("DIGIT")) {
+      throw new DerivApiError("UnsupportedContract", `${input.contractType} is not offered on step indices. Use CALL or PUT.`);
+    }
     const key = `proposal:${input.symbol}:${input.contractType}:${input.barrier ?? ""}:${input.duration}:${input.amount}`;
     if (this.subscriptions.has(key)) return;
     const wait = Math.max(0, PROPOSAL_INTERVAL_MS - (Date.now() - this.lastProposalRequestAt));
@@ -613,7 +619,8 @@ export class DerivClient {
       currency: input.currency,
       duration: input.duration,
       duration_unit: "t",
-      symbol: input.symbol,
+      // New API rejects the Legacy "symbol" field here.
+      underlying_symbol: input.symbol,
     };
     if (input.contractType === "DIGITMATCH" || input.contractType === "DIGITDIFF") payload.barrier = input.barrier ?? "0";
     await this.sendSubscription(key, payload, true);

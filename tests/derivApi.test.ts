@@ -45,12 +45,13 @@ class MockWebSocket {
     if (request.active_symbols) {
       response = {
         msg_type: "active_symbols",
+        // Exactly the New Options API shape observed on the public socket.
         active_symbols: [
-          { symbol: "R_100", display_name: "Volatility 100 Index", pip: 0.001, exchange_is_open: 1 },
-          { symbol: "1HZ10V", display_name: "Volatility 10 (1s) Index", pip: 0.001, exchange_is_open: 1 },
-          { symbol: "stpRNG2", display_name: "Step Index 2", pip: 0.001, exchange_is_open: 1 },
-          { symbol: "JD10", display_name: "Jump 10 Index", pip: 0.01, exchange_is_open: 1 },
-          { symbol: "EURUSD", display_name: "EUR/USD", pip: 0.00001, exchange_is_open: 1 },
+          { underlying_symbol: "R_100", underlying_symbol_name: "Volatility 100 Index", pip_size: 0.01, exchange_is_open: 1 },
+          { underlying_symbol: "1HZ10V", underlying_symbol_name: "Volatility 10 (1s) Index", pip_size: 0.001, exchange_is_open: 1 },
+          { underlying_symbol: "stpRNG2", underlying_symbol_name: "Step Index 2", pip_size: 0.1, exchange_is_open: 1 },
+          { underlying_symbol: "JD10", underlying_symbol_name: "Jump 10 Index", pip_size: 0.01, exchange_is_open: 1 },
+          { underlying_symbol: "EURUSD", underlying_symbol_name: "EUR/USD", pip_size: 0.00001, exchange_is_open: 1 },
         ],
       };
     } else if (request.balance) {
@@ -113,6 +114,9 @@ beforeEach(() => {
     const otp = /\/accounts\/([^/]+)\/otp$/.exec(url);
     if (otp) {
       expect(init?.method).toBe("POST");
+      // Deriv rejects an OTP request that carries a body or a JSON content type.
+      expect(init?.body).toBeUndefined();
+      expect((init?.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
       const accountId = decodeURIComponent(otp[1]);
       otpAccounts.push(accountId);
       const mode = accountId === "CR900001" ? "real" : "demo";
@@ -173,6 +177,9 @@ describe("Deriv API boundaries", () => {
     expect(headers["Deriv-App-ID"]).toBe("12aBc34");
     expect(MockWebSocket.instances[0].url).toContain("wss://api.derivws.com/trading/v1/options/ws/demo?otp=");
     expect(MockWebSocket.instances[0].sent.some((request) => "authorize" in request)).toBe(false);
+    // "product_type" was removed from active_symbols in the New API and fails validation.
+    const symbolRequest = MockWebSocket.instances[0].sent.find((request) => request.active_symbols);
+    expect(symbolRequest).toEqual({ active_symbols: "brief", req_id: expect.any(Number) });
   });
 
   it("rejects a malformed App ID before touching the network", async () => {
@@ -206,6 +213,10 @@ describe("Deriv API boundaries", () => {
     await expect(bought).resolves.toEqual({ contractId: 12345, proposal, buyPrice: 1 });
     const buyRequest = MockWebSocket.instances[0].sent.find((request) => request.buy);
     expect(buyRequest).toMatchObject({ buy: proposal.id, price: proposal.askPrice });
+    const proposalRequest = MockWebSocket.instances[0].sent.find((request) => request.proposal);
+    expect(proposalRequest).toMatchObject({ underlying_symbol: "R_100" });
+    expect(proposalRequest).not.toHaveProperty("symbol");
+    expect(proposalRequest).not.toHaveProperty("product_type");
   });
 
   it("rejects stale proposals before sending a purchase", async () => {
@@ -218,6 +229,16 @@ describe("Deriv API boundaries", () => {
     };
     await expect(client.buyProposal(stale)).rejects.toThrow(/expired/i);
     expect(MockWebSocket.instances[0].sent.some((request) => request.buy)).toBe(false);
+  });
+
+  it("refuses digit contracts on step indices, which Deriv does not quote", async () => {
+    const client = new DerivClient();
+    clients.push(client);
+    await client.connect("test-token", "12aBc34");
+    await expect(client.subscribeProposal({
+      symbol: "stpRNG2", contractType: "DIGITMATCH", barrier: "3", duration: 1, amount: 1, currency: "USD",
+    })).rejects.toThrow(/step indices/i);
+    expect(MockWebSocket.instances[0].sent.some((request) => request.proposal)).toBe(false);
   });
 
   it("switches accounts by requesting a fresh OTP socket", async () => {

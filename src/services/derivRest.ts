@@ -59,8 +59,10 @@ async function call(
       headers: {
         Authorization: `Bearer ${credentials.token}`,
         "Deriv-App-ID": credentials.appId,
-        "Content-Type": "application/json",
         Accept: "application/json",
+        // Only declare a JSON body when one is actually sent: the OTP endpoint
+        // rejects requests that carry a body/Content-Type it does not expect.
+        ...(init.body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       signal: controller.signal,
     });
@@ -129,7 +131,6 @@ export async function fetchDerivAccounts(credentials: DerivCredentials): Promise
 export async function requestDerivOtp(credentials: DerivCredentials, accountId: string): Promise<string> {
   const payload = await call(credentials, `/trading/v1/options/accounts/${encodeURIComponent(accountId)}/otp`, {
     method: "POST",
-    body: JSON.stringify({}),
   });
   const data = unwrap(payload) as Record<string, unknown>;
   const url = String(

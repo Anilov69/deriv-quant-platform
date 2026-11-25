@@ -184,6 +184,7 @@ export function useQuantPlatform() {
   const [authOpen, setAuthOpen] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const lastToast = useRef<{ message: string; at: number }>({ message: "", at: 0 });
 
   useEffect(() => {
     accountKindRef.current = account.kind;
@@ -192,6 +193,10 @@ export function useQuantPlatform() {
   }, [account.kind, symbol, ticks]);
 
   const pushToast = useCallback((message: string, tone: ToastMessage["tone"] = "info") => {
+    // Reconnect loops can emit the same failure several times; show it once.
+    const now = Date.now();
+    if (lastToast.current.message === message && now - lastToast.current.at < 5_000) return;
+    lastToast.current = { message, at: now };
     const id = ++toastSequence.current;
     setToasts((current) => [...current.slice(-3), { id, tone, message }]);
     const timer = setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 4_500);
@@ -374,6 +379,8 @@ export function useQuantPlatform() {
       const next: Partial<Record<ContractType, Proposal>> = {};
       for (const contractType of proposalTypes) {
         const isDigit = contractType === "DIGITMATCH" || contractType === "DIGITDIFF";
+        // Step indices quote no digit contracts, so never request them.
+        if (isDigit && familyForSymbol(symbol) === "step") continue;
         next[contractType] = simulationProposal(symbol, contractType, isDigit ? String(selectedBarrier) : undefined, isDigit ? 1 : riseFallDuration, stake, account.currency);
       }
       setProposals(next);
@@ -391,6 +398,8 @@ export function useQuantPlatform() {
       if (cancelled || !clientRef.current) return;
       for (const contractType of proposalTypes) {
         const isDigit = contractType === "DIGITMATCH" || contractType === "DIGITDIFF";
+        // Step indices quote no digit contracts, so never request them.
+        if (isDigit && familyForSymbol(symbol) === "step") continue;
         await clientRef.current.subscribeProposal({
           symbol,
           contractType,
