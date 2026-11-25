@@ -7,7 +7,7 @@ class MockWebSocket {
   static readonly OPEN = 1;
   static readonly CLOSED = 3;
   static instances: MockWebSocket[] = [];
-  static failAuthorization = false;
+  static failHandshake = false;
   static currentLoginId = "VRTC100";
 
   readyState = MockWebSocket.CONNECTING;
@@ -18,8 +18,15 @@ class MockWebSocket {
   readonly sent: Array<Record<string, unknown>> = [];
 
   constructor(readonly url: string) {
+    MockWebSocket.currentLoginId = new URL(url).pathname.endsWith("/real") ? "CR100" : "VRTC100";
     MockWebSocket.instances.push(this);
     queueMicrotask(() => {
+      if (MockWebSocket.failHandshake) {
+        this.readyState = MockWebSocket.CLOSED;
+        this.onerror?.(new Event("error"));
+        this.onclose?.({ type: "close" } as CloseEvent);
+        return;
+      }
       this.readyState = MockWebSocket.OPEN;
       this.onopen?.(new Event("open"));
     });
@@ -31,30 +38,7 @@ class MockWebSocket {
     const reqId = request.req_id;
     let response: Record<string, unknown>;
 
-    if (request.authorize) {
-      if (!MockWebSocket.failAuthorization) MockWebSocket.currentLoginId = String(request.account ?? "VRTC100");
-      response = MockWebSocket.failAuthorization
-        ? { error: { code: "InvalidToken", message: `Rejected ${String(request.authorize)}` } }
-        : {
-          msg_type: "authorize",
-          authorize: {
-            loginid: String(request.account ?? "VRTC100"),
-            fullname: "Test account",
-            account_list: [
-              { loginid: "VRTC100", currency: "USD", account_name: "Demo" },
-              { loginid: "CR100", currency: "USD", account_name: "Real" },
-            ],
-          },
-        };
-    } else if (request.account_list) {
-      response = {
-        msg_type: "account_list",
-        account_list: [
-          { loginid: "VRTC100", currency: "USD", account_name: "Demo" },
-          { loginid: "CR100", currency: "USD", account_name: "Real" },
-        ],
-      };
-    } else if (request.active_symbols) {
+    if (request.active_symbols) {
       response = {
         msg_type: "active_symbols",
         active_symbols: [
@@ -89,12 +73,26 @@ class MockWebSocket {
   }
 
   close(): void {
+    if (this.readyState === MockWebSocket.CLOSED) return;
     this.readyState = MockWebSocket.CLOSED;
     this.onclose?.({ type: "close" } as CloseEvent);
+  }
+
+  serverClose(): void {
+    this.close();
   }
 }
 
 const clients: DerivClient[] = [];
+const fetchMock = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>();
+let failAccounts = false;
+let invalidOtpUrl = false;
+let failOtpAccount = "";
+let otpSequence = 0;
+
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
+}
 
 function eventOnce<K extends keyof DerivClientEvents>(client: DerivClient, event: K): Promise<DerivClientEvents[K]> {
   return new Promise((resolve) => {
@@ -107,13 +105,41 @@ function eventOnce<K extends keyof DerivClientEvents>(client: DerivClient, event
 
 beforeEach(() => {
   MockWebSocket.instances = [];
-  MockWebSocket.failAuthorization = false;
+  MockWebSocket.failHandshake = false;
   MockWebSocket.currentLoginId = "VRTC100";
+  failAccounts = false;
+  invalidOtpUrl = false;
+  failOtpAccount = "";
+  otpSequence = 0;
+  fetchMock.mockReset();
+  fetchMock.mockImplementation(async (input, init) => {
+    const url = new URL(String(input));
+    const headers = new Headers(init?.headers);
+    expect(headers.get("Authorization")).toBe("Bearer test-token");
+    expect(headers.get("Deriv-App-ID")).toBe("1234");
+    if (url.pathname === "/trading/v1/options/accounts") {
+      if (failAccounts) return jsonResponse({ errors: [{ status: 401, code: "Unauthorized", message: "Rejected test-token" }], meta: {} }, 401);
+      return jsonResponse({
+        data: [
+          { account_id: "VRTC100", account_type: "demo", balance: 1000, currency: "USD", group: "row", status: "active" },
+          { account_id: "CR100", account_type: "real", balance: 250, currency: "USD", group: "row", status: "active" },
+        ],
+        meta: {},
+      });
+    }
+    const accountId = decodeURIComponent(url.pathname.split("/")[5] ?? "");
+    if (accountId === failOtpAccount) return jsonResponse({ errors: [{ status: 400, code: "AccountNotFound", message: "Account unavailable" }], meta: {} }, 400);
+    const kind = accountId === "CR100" ? "real" : "demo";
+    otpSequence += 1;
+    return jsonResponse({ data: { url: invalidOtpUrl ? "https://example.com/socket" : `wss://api.derivws.com/trading/v1/options/ws/${kind}?otp=otp-${otpSequence}` }, meta: {} });
+  });
   vi.stubGlobal("WebSocket", MockWebSocket);
+  vi.stubGlobal("fetch", fetchMock);
 });
 
 afterEach(() => {
   for (const client of clients.splice(0)) client.clearCredentials();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
@@ -128,7 +154,15 @@ describe("Deriv API boundaries", () => {
     expect(redactSecret("token abc123 failed", "abc123")).toBe("token [redacted] failed");
   });
 
-  it("authorizes, loads accounts and supported symbols, and resolves the balance stream", async () => {
+  it("requires a new numeric Options API App ID", async () => {
+    const client = new DerivClient();
+    clients.push(client);
+    await expect(client.connect("test-token", "")).rejects.toThrow(/App ID/i);
+    await expect(client.connect("test-token", "1089")).rejects.toThrow(/legacy registry ID/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("discovers accounts, opens an OTP session, and loads symbols and balance", async () => {
     const client = new DerivClient();
     clients.push(client);
     const authorized = eventOnce(client, "authorized");
@@ -138,23 +172,50 @@ describe("Deriv API boundaries", () => {
 
     await client.connect("test-token", "1234");
 
-    await expect(authorized).resolves.toEqual({ loginId: "VRTC100", name: "Test account" });
-    await expect(accounts).resolves.toHaveLength(2);
+    await expect(authorized).resolves.toEqual({ loginId: "VRTC100", name: "Demo VRTC100" });
+    await expect(accounts).resolves.toEqual([
+      expect.objectContaining({ loginid: "VRTC100", kind: "demo" }),
+      expect.objectContaining({ loginid: "CR100", kind: "real" }),
+    ]);
     await expect(symbols).resolves.toEqual(expect.arrayContaining([
       expect.objectContaining({ symbol: "R_100", family: "continuous" }),
       expect.objectContaining({ symbol: "stpRNG2", family: "step" }),
       expect.objectContaining({ symbol: "JD10", family: "jump" }),
     ]));
     expect((await symbols).some((item) => item.symbol === "EURUSD")).toBe(false);
-    await expect(balance).resolves.toEqual({ currency: "USD", balance: 1000, loginId: "VRTC100" });
-    expect(MockWebSocket.instances[0].url).toContain("app_id=1234");
+    await expect(balance).resolves.toEqual({ currency: "USD", balance: 1000, loginId: "VRTC100", kind: "demo" });
+    expect(MockWebSocket.instances[0].url).toBe("wss://api.derivws.com/trading/v1/options/ws/demo?otp=otp-1");
+    expect(MockWebSocket.instances[0].sent.some((request) => request.authorize)).toBe(false);
+    expect(fetchMock.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual([
+      "/trading/v1/options/accounts",
+      "/trading/v1/options/accounts/VRTC100/otp",
+    ]);
   });
 
-  it("clears credentials and redacts the token when authorization fails", async () => {
-    MockWebSocket.failAuthorization = true;
+  it("clears credentials and redacts the token when REST authorization fails", async () => {
+    failAccounts = true;
     const client = new DerivClient();
     clients.push(client);
-    await expect(client.connect("secret-token")).rejects.toThrow("Rejected [redacted]");
+    await expect(client.connect("test-token", "1234")).rejects.toThrow("Rejected [redacted]");
+    expect((client as unknown as { token: string }).token).toBe("");
+    expect(client.connected).toBe(false);
+    expect(MockWebSocket.instances).toHaveLength(0);
+  });
+
+  it("rejects an untrusted OTP URL without opening a socket", async () => {
+    invalidOtpUrl = true;
+    const client = new DerivClient();
+    clients.push(client);
+    await expect(client.connect("test-token", "1234")).rejects.toThrow(/invalid WebSocket URL/i);
+    expect(MockWebSocket.instances).toHaveLength(0);
+    expect((client as unknown as { token: string }).token).toBe("");
+  });
+
+  it("clears credentials when the WebSocket handshake fails", async () => {
+    MockWebSocket.failHandshake = true;
+    const client = new DerivClient();
+    clients.push(client);
+    await expect(client.connect("test-token", "1234")).rejects.toThrow(/Could not reach Deriv/i);
     expect((client as unknown as { token: string }).token).toBe("");
     expect(client.connected).toBe(false);
   });
@@ -162,7 +223,7 @@ describe("Deriv API boundaries", () => {
   it("parses a live proposal, buys that exact quote, and tracks its contract", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await client.connect("test-token");
+    await client.connect("test-token", "1234");
     const proposalEvent = eventOnce(client, "proposal");
     await client.subscribeProposal({ symbol: "R_100", contractType: "DIGITMATCH", barrier: "5", duration: 1, amount: 1, currency: "USD" });
     const proposal = await proposalEvent;
@@ -178,7 +239,7 @@ describe("Deriv API boundaries", () => {
   it("rejects stale proposals before sending a purchase", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await client.connect("test-token");
+    await client.connect("test-token", "1234");
     const stale: Proposal = {
       id: "stale", contractType: "CALL", symbol: "R_100", duration: 3, durationUnit: "t",
       askPrice: 1, payout: 1.95, spot: 100, currency: "USD", receivedAt: Date.now() - 5_000,
@@ -187,13 +248,40 @@ describe("Deriv API boundaries", () => {
     expect(MockWebSocket.instances[0].sent.some((request) => request.buy)).toBe(false);
   });
 
-  it("selects and verifies the requested account before resubscribing balance", async () => {
+  it("opens a fresh real-account OTP session when switching accounts", async () => {
     const client = new DerivClient();
     clients.push(client);
-    await client.connect("test-token");
+    await client.connect("test-token", "1234");
     const balance = eventOnce(client, "balance");
     await client.switchAccount("CR100");
-    expect(MockWebSocket.instances[0].sent.some((request) => request.authorize && request.account === "CR100")).toBe(true);
-    expect((await balance).loginId).toBe("CR100");
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toBe("wss://api.derivws.com/trading/v1/options/ws/real?otp=otp-2");
+    expect(MockWebSocket.instances[1].sent.some((request) => request.authorize)).toBe(false);
+    await expect(balance).resolves.toEqual({ currency: "USD", balance: 1000, loginId: "CR100", kind: "real" });
+  });
+
+  it("restores the previous account when an account switch fails", async () => {
+    const client = new DerivClient();
+    clients.push(client);
+    await client.connect("test-token", "1234");
+    failOtpAccount = "CR100";
+    await expect(client.switchAccount("CR100")).rejects.toThrow(/Account unavailable/i);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toContain("/ws/demo?otp=otp-2");
+    expect(client.connectionStatus).toBe("connected");
+  });
+
+  it("requests a fresh OTP and resubscribes after a server disconnect", async () => {
+    const client = new DerivClient();
+    clients.push(client);
+    await client.connect("test-token", "1234");
+    vi.useFakeTimers();
+    MockWebSocket.instances[0].serverClose();
+    expect(client.connectionStatus).toBe("reconnecting");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toContain("/ws/demo?otp=otp-2");
+    expect(MockWebSocket.instances[1].sent.some((request) => request.balance && request.subscribe === 1)).toBe(true);
+    expect(client.connectionStatus).toBe("connected");
   });
 });

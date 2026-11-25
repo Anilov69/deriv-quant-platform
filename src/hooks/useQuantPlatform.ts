@@ -214,7 +214,10 @@ export function useQuantPlatform() {
       setConsecutiveLosses(0);
       setAccounts((current) => {
         const match = current.find((item) => item.loginid === loginId);
-        if (match) setAccount(match);
+        if (match) {
+          accountKindRef.current = match.kind;
+          setAccount(match);
+        }
         return current;
       });
     });
@@ -224,7 +227,8 @@ export function useQuantPlatform() {
     });
     bind("balance", (nextBalance) => {
       setBalance(nextBalance.balance);
-      setAccount((current) => current.loginid === nextBalance.loginId ? current : { loginid: nextBalance.loginId, currency: nextBalance.currency, kind: nextBalance.loginId.startsWith("VRTC") ? "demo" : "real", name: nextBalance.loginId });
+      accountKindRef.current = nextBalance.kind;
+      setAccount((current) => current.loginid === nextBalance.loginId ? current : { loginid: nextBalance.loginId, currency: nextBalance.currency, kind: nextBalance.kind, name: nextBalance.loginId });
       if (!baselineReadyRef.current) {
         baselineReadyRef.current = true;
         setStartBalance(nextBalance.balance);
@@ -305,7 +309,7 @@ export function useQuantPlatform() {
         let quote = last.quote;
         if (family === "continuous") quote += (random() - 0.5) * 0.18 + Math.sin(Date.now() / 30_000) * 0.01;
         else if (family === "step") quote += random() < 0.5 ? 0.09 : 0.11;
-        else quote += random() < 0.025 ? (random() < 0.5 ? -1.4 : 1.4) : (random() - 0.5) * 0.08;
+        else quote += (random() < 0.025 ? (random() < 0.5 ? -1.4 : 1.4) : (random() - 0.5) * 0.08);
         quote = Number(quote.toFixed(3));
         return appendTick(current, { epoch: Date.now(), quote, digit: tickDigits(quote) });
       });
@@ -445,7 +449,7 @@ export function useQuantPlatform() {
     for (const trade of settledTrades) {
       cumulative += trade.profit;
       peak = Math.max(peak, cumulative);
-      maxDrawdown = Math.max(maxDrawdown, peak - cumulative);
+      maxDrawdown = Math.max(maxDrawdown, peak - maxDrawdown);
       curve.push(Number(cumulative.toFixed(2)));
     }
     const wins = settledTrades.filter((trade) => trade.profit > 0).length;
