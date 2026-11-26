@@ -136,6 +136,7 @@ export class DerivSession {
   accountId = "";
   onStatus: ((status: Status, detail: string) => void) | null = null;
   onTick: ((tick: Tick) => void) | null = null;
+  onTickFor: ((symbol: string, tick: Tick) => void) | null = null;
   onSymbols: ((symbols: SymbolInfo[]) => void) | null = null;
   onBalance: ((balance: number, currency: string) => void) | null = null;
   onContract: ((contract: any) => void) | null = null;
@@ -145,6 +146,7 @@ export class DerivSession {
   private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
   private sequence = 1;
   private tickSubscription: string | null = null;
+  private tickSymbols = new Map<string, string>();
   private ping: ReturnType<typeof setInterval> | undefined;
   private token = "";
   private appId = "";
@@ -253,7 +255,10 @@ export class DerivSession {
     if (message.msg_type === "tick" && message.tick) {
       // The first frame of a ticks subscription carries the req_id too, so the
       // awaiting caller still needs resolving below.
-      this.onTick?.({ epoch: num(message.tick.epoch), quote: num(message.tick.quote) });
+      const tick = { epoch: num(message.tick.epoch), quote: num(message.tick.quote) };
+      const owner = message.subscription?.id ? this.tickSymbols.get(String(message.subscription.id)) : undefined;
+      if (owner) this.onTickFor?.(owner, tick);
+      else this.onTick?.(tick);
     }
 
     if (message.msg_type === "balance" && message.balance) {
@@ -325,6 +330,27 @@ export class DerivSession {
     this.tickSubscription = String(message?.subscription?.id ?? "");
   }
 
+  /**
+   * A second, independent tick stream for a named page (the gap engine), so the
+   * terminal's own subscription keeps its symbol. Returns the subscription id.
+   */
+  async subscribeTicksFor(symbol: string): Promise<string> {
+    const message = await this.send({ ticks: symbol, subscribe: 1 });
+    const id = String(message?.subscription?.id ?? "");
+    if (id) this.tickSymbols.set(id, symbol);
+    return id;
+  }
+
+  async forget(subscriptionId: string): Promise<void> {
+    if (!subscriptionId) return;
+    this.tickSymbols.delete(subscriptionId);
+    try {
+      await this.send({ forget: subscriptionId });
+    } catch {
+      /* the subscription may already be gone */
+    }
+  }
+
   async subscribeBalance(): Promise<void> {
     await this.send({ balance: 1, subscribe: 1 });
   }
@@ -383,8 +409,9 @@ export class DerivSession {
     return contractId;
   }
 
-  async watch(contractId: number): Promise<void> {
-    await this.send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1 });
+  async watch(contractId: number): Promise<string> {
+    const message = await this.send({ proposal_open_contract: 1, contract_id: contractId, subscribe: 1 });
+    return String(message?.subscription?.id ?? "");
   }
 
   disconnect(): void {

@@ -181,6 +181,8 @@ export default function AutoTradePanel(props: Props): ReactElement {
     onArmedChange(autoOn);
   }, [autoOn, onArmedChange]);
 
+  useEffect(() => () => engine.stop("Terminal panel closed"), [engine]);
+
   const accountRef = useRef(accountId);
   useEffect(() => {
     if (accountRef.current === accountId) return;

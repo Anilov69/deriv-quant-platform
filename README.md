@@ -81,6 +81,25 @@ only in the `Authorization` header to `api.derivws.com`.
 
 Use a token scoped to reading and trading, and revoke it when you are done.
 
+## Gap Engine (`#/gap-engine`)
+
+A second page, reached from the header nav, that trades only Rise/Fall on the
+three synthetic families. Routing is a `hashchange` listener in `App`, so a
+direct load of `/#/gap-engine` works on GitHub Pages with no 404. The page takes
+the terminal's `DerivSession` by ref: one socket, one OTP login, one balance
+stream, the same Demo/Real account switch.
+
+The signal is the micro-tick gap: the last `N` ticks give `N-1` intervals,
+each classified up / flat / down, and the signal needs `|Up% - Down%| >= minGap`
+pp. Flat stays in the denominator on purpose, so a stagnant tape cannot fake a
+direction. Momentum buys the leading side; mean-reversion fades it. Execution is
+a ref-driven state machine (`isRunningRef`, `isExecutingRef`, `inCooldownRef`):
+the lock is taken synchronously before the proposal, released only after
+`proposal_open_contract.is_sold === 1` and the cooldown, with a 180 s settlement
+timeout that stops the bot instead of trading blind. Take-profit / stop-loss are
+checked on the settled `profit`; a REAL account needs the confirmation dialog
+and the word `REAL`.
+
 ## Auto-trade and martingale
 
 Arming **AUTO-TRADE** turns the ladder from a table into an execution loop:

@@ -7,6 +7,7 @@ import type { Candidate, RankedQuote } from "@/ladder";
 import { AutoTrader } from "@/autotrade";
 import type { Snapshot } from "@/autotrade";
 import AutoTradePanel from "@/AutoTradePanel";
+import GapEnginePage from "@/pages/GapEnginePage";
 import {
   digitsFrom,
   entropyBits,
@@ -29,6 +30,14 @@ interface StoredCredentials {
 interface Notice {
   tone: "ok" | "bad" | "info";
   text: string;
+}
+
+type Route = "home" | "gap";
+
+/** GitHub Pages has no server-side routing, so the page lives in the hash. */
+function readRoute(): Route {
+  const path = window.location.hash.replace(/^#\/?/, "").split("?")[0];
+  return path === "gap-engine" ? "gap" : "home";
 }
 
 function readStore(store: Storage): StoredCredentials | null {
@@ -142,7 +151,20 @@ export default function App(): ReactElement {
   const [remember, setRemember] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   const [autoArmed, setAutoArmed] = useState(false);
+  const [route, setRoute] = useState<Route>(() => readRoute());
   const quotingRef = useRef(false);
+  const routeRef = useRef<Route>(route);
+  const gapContractRef = useRef<((payload: any) => void) | null>(null);
+
+  useEffect(() => {
+    routeRef.current = route;
+  }, [route]);
+
+  useEffect(() => {
+    const onHash = () => setRoute(readRoute());
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
 
   useEffect(() => {
     const session = new DerivSession();
@@ -163,6 +185,8 @@ export default function App(): ReactElement {
     session.onError = (message) => setNotice({ tone: "bad", text: message });
     session.onContract = (payload) => {
       autoRef.current?.onContractUpdate(payload);
+      gapContractRef.current?.(payload);
+      if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
         const copy = [...previous];
@@ -199,6 +223,28 @@ export default function App(): ReactElement {
     }
   }, []);
 
+  const notify = useCallback((text: string, tone: "bad" | "ok") => {
+    setNotice({ tone, text });
+  }, []);
+
+  const bindContractListener = useCallback((handler: ((payload: any) => void) | null) => {
+    gapContractRef.current = handler;
+  }, []);
+
+  const switchAccount = useCallback((next: string) => {
+    const session = sessionRef.current;
+    if (!session || !next || next === accountId) return;
+    setAccountId(next);
+    void session
+      .switchTo(next)
+      .then(() => session.subscribeBalance())
+      .catch((error: Error) => setNotice({ tone: "bad", text: error.message }));
+  }, [accountId]);
+
+  useEffect(() => {
+    if (route === "gap") autoRef.current?.stop("Terminal panel closed");
+  }, [route]);
+
   useEffect(() => {
     if (restoredRef.current) return;
     restoredRef.current = true;
@@ -220,6 +266,7 @@ export default function App(): ReactElement {
   useEffect(() => {
     const session = sessionRef.current;
     if (!session || status !== "live" || !symbol) return;
+    if (route !== "home") return;
     let cancelled = false;
     setPrices([]);
     session.subscribeTicks(symbol).catch((error: Error) => setNotice({ tone: "bad", text: error.message }));
@@ -229,7 +276,7 @@ export default function App(): ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [status, symbol]);
+  }, [route, status, symbol]);
 
   const symbolInfo = useMemo(() => symbols.find((item) => item.symbol === symbol) ?? null, [symbols, symbol]);
   const decimals = useMemo(() => {
@@ -348,6 +395,7 @@ export default function App(): ReactElement {
 
   useEffect(() => {
     if (status !== "live" || !symbol) return;
+    if (route !== "home") return;
     // While auto-trade is armed it owns the proposal budget; the table would
     // compete with the engine and re-trigger Deriv's burst limit.
     if (autoArmed) {
@@ -357,7 +405,7 @@ export default function App(): ReactElement {
     void refreshRef.current();
     const timer = window.setInterval(() => void refreshRef.current(), 12000);
     return () => window.clearInterval(timer);
-  }, [status, symbol, stake, currency, autoArmed]);
+  }, [status, symbol, stake, currency, autoArmed, route]);
 
   const buy = useCallback(async (row: RankedQuote): Promise<void> => {
     const session = sessionRef.current;
@@ -437,6 +485,14 @@ export default function App(): ReactElement {
           <h1 className="text-base font-semibold tracking-tight">Digit Edge</h1>
           <p className="text-xs text-muted">Contract-ladder search for Deriv synthetic indices</p>
         </div>
+        <nav className="flex items-center gap-1 text-xs" aria-label="Pages">
+          <a href="#/" className={"rounded px-2 py-1 " + (route === "home" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Main Terminal
+          </a>
+          <a href="#/gap-engine" className={"rounded px-2 py-1 " + (route === "gap" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Gap Engine
+          </a>
+        </nav>
         <div className="flex items-center gap-3 text-xs">
           <span className={"rounded-full border px-3 py-1 " + (live ? "border-accent/40 text-accent" : status === "error" ? "border-danger/40 text-danger" : "border-line text-muted")}>
             {status === "live" ? "LIVE" : status.toUpperCase()}
@@ -515,6 +571,23 @@ export default function App(): ReactElement {
         </div>
       ) : null}
 
+      {route === "gap" ? (
+        <GapEnginePage
+          sessionRef={sessionRef}
+          connected={live}
+          symbols={symbols}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindContractListener}
+        />
+      ) : (
+        <>
       <main className="grid gap-0 lg:grid-cols-[230px_minmax(0,1fr)_300px]">
         <aside className="border-b border-line p-3 lg:border-b-0 lg:border-r">
           <input
@@ -744,6 +817,8 @@ export default function App(): ReactElement {
         currency={currency}
         symbol={symbol}
       />
+        </>
+      )}
 
       <footer className="border-t border-line px-5 py-3 text-[11px] text-muted">
         Prices and payouts come from Deriv's New Options API over a single-use OTP socket. Synthetic indices
