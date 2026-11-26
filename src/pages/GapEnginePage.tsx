@@ -462,12 +462,12 @@ export default function GapEnginePage(props: Props): ReactElement {
             </div>
           </div>
 
-          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded border border-line bg-ink px-4 py-3">
-            <div className="flex items-center gap-3">
-              <span className={"rounded-full border px-4 py-1.5 text-lg font-semibold " + signalTone}>{signalLabel}</span>
+          <div className="mt-4 flex flex-col gap-3 rounded border border-line bg-ink px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex flex-wrap items-center gap-3">
+              <span className={"whitespace-nowrap rounded-full border px-4 py-1.5 text-base font-semibold sm:text-lg " + signalTone}>{signalLabel}</span>
               <span className="text-xs text-muted">{spreadText}</span>
             </div>
-            <span className="text-[11px] text-muted">
+            <span className="text-[11px] text-muted sm:text-right">
               {settings.mode === "momentum" ? "Momentum" : "Mean-reversion"} - min {settings.minGapPp} pp - {settings.duration} ticks
             </span>
           </div>
@@ -485,7 +485,7 @@ export default function GapEnginePage(props: Props): ReactElement {
               {running ? "Pause" : "Start"}
             </button>
             <span role="status" className={"rounded-full border px-3 py-1 text-[11px] " + (running ? "border-accent/40 text-accent" : "border-line text-muted")}>{phase}</span>
-            <span className="ml-auto text-[11px] text-muted">
+            <span className="w-full text-[11px] text-muted sm:ml-auto sm:w-auto sm:text-right">
               {accountId || "no account"} ({accountKind}) - {balance !== null ? balance.toFixed(2) : "-"} {currency}
             </span>
           </div>
