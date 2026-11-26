@@ -6,6 +6,7 @@ import {
   buildMesh,
   bundleTotal,
   combinedProbability,
+  computeRiskPlan,
   consensusOf,
   decimalsFromPip,
   digitsFromQuotes,
@@ -212,17 +213,17 @@ describe("stake planning", () => {
     expect(bundleTotal(splitStakes(0.35, false))).toBe(1.05);
   });
 
-  it("adds a 1.5x bonus to leg one in weighted mode", () => {
+  it("multiplies leg one by 1.5 in weighted mode", () => {
     const three = splitStakes(0.6, true);
-    expect(three).toEqual([1.5, 0.6, 0.6]);
-    expect(bundleTotal(three)).toBe(2.7);
-    expect(splitStakes(0.35, true, 5)).toEqual([0.88, 0.35, 0.35, 0.35, 0.35]);
+    expect(three).toEqual([0.9, 0.6, 0.6]);
+    expect(bundleTotal(three)).toBe(2.1);
+    expect(splitStakes(0.35, true, 5)).toEqual([0.53, 0.35, 0.35, 0.35, 0.35]);
     expect(splitStakes(0.35, false, 4)).toEqual([0.35, 0.35, 0.35, 0.35]);
   });
 
   it("clamps tiny or invalid stakes up to the minimum", () => {
     expect(splitStakes(0.2, false)).toEqual([0.35, 0.35, 0.35]);
-    expect(splitStakes(0.2, true)).toEqual([0.88, 0.35, 0.35]);
+    expect(splitStakes(0.2, true)).toEqual([0.53, 0.35, 0.35]);
     expect(splitStakes(Number.NaN, false)).toEqual([0.35, 0.35, 0.35]);
     expect(splitStakes(0.444, false)[0]).toBe(0.44);
     expect(splitStakes(0.35, false, 99)).toHaveLength(5);
@@ -258,6 +259,55 @@ describe("prediction and martingale scaling", () => {
     expect(streakMissProbability(0.5, 0)).toBeCloseTo(0.5, 10);
     expect(streakMissProbability(0.5, 2)).toBeCloseTo(0.125, 10);
     expect(streakMissProbability(1, 3)).toBe(0);
+  });
+});
+
+describe("risk plan and auto SL/TP", () => {
+  const base = { baseStake: 0.35, predictionCount: 3 as const, splitMode: "equal" as const };
+
+  it("rounds a two-level cycle up to 5.45 and targets 4.00", () => {
+    const plan = computeRiskPlan({ ...base, martingaleEnabled: true, multiplier: 1.6, maxLevels: 2 });
+    expect(plan.levels.map((level) => level.bundleCost)).toEqual([1.05, 1.68, 2.7]);
+    expect(plan.rawCycleCost).toBe(5.43);
+    expect(plan.autoStopLoss).toBe(5.45);
+    expect(plan.estLevel0NetWin).toBe(2.05);
+    expect(plan.autoTakeProfit).toBe(4);
+    expect(plan.recommendedBuffer).toBe(19.08);
+  });
+
+  it("rounds a three-level cycle up to 9.75 and moves TP to 6.25", () => {
+    const plan = computeRiskPlan({ ...base, martingaleEnabled: true, multiplier: 1.6, maxLevels: 3 });
+    expect(plan.rawCycleCost).toBe(9.72);
+    expect(plan.autoStopLoss).toBe(9.75);
+    expect(plan.autoTakeProfit).toBe(6.25);
+  });
+
+  it("collapses to one level when martingale is off", () => {
+    const plan = computeRiskPlan({ ...base, martingaleEnabled: false, multiplier: 1.6, maxLevels: 6 });
+    expect(plan.levels).toHaveLength(1);
+    expect(plan.effectiveMaxLevels).toBe(0);
+    expect(plan.effectiveMultiplier).toBe(1);
+    expect(plan.autoStopLoss).toBe(1.05);
+    expect(plan.autoTakeProfit).toBe(4);
+    expect(plan.recommendedBuffer).toBe(3.68);
+  });
+
+  it("uses the exact weighted leg split in every level", () => {
+    const plan = computeRiskPlan({
+      baseStake: 0.35,
+      predictionCount: 5,
+      splitMode: "weighted",
+      martingaleEnabled: true,
+      multiplier: 2.4,
+      maxLevels: 1,
+    });
+    expect(plan.levels[0].stakes).toEqual([0.53, 0.35, 0.35, 0.35, 0.35]);
+    expect(plan.initialBundleCost).toBe(1.93);
+    expect(plan.levels[1].stepStakePerDigit).toBe(0.84);
+    expect(plan.levels[1].legOneStake).toBe(1.26);
+    expect(plan.levels[1].bundleCost).toBe(4.62);
+    expect(plan.rawCycleCost).toBe(6.55);
+    expect(plan.autoStopLoss).toBe(6.55);
   });
 });
 

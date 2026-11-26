@@ -235,15 +235,15 @@ export function dominanceShare(combined: number, baseline = UNIFORM_THREE_DIGIT)
 }
 
 /**
- * Flat: every leg at the per-digit stake.
- * Weighted: leg #1 gets a further 1.5x of the per-digit stake; legs #2..K stay
- * at the per-digit stake. Every leg is clamped to the 0.35 Deriv minimum.
+ * Equal: every leg at the per-digit stake.
+ * Weighted: leg #1 gets 1.5x the per-digit stake; legs #2..K stay at the
+ * per-digit stake. Every leg is clamped to the 0.35 Deriv minimum.
  */
 export function splitStakes(base: number, weighted: boolean, count = 3): number[] {
   const clean = round2(Math.max(MIN_STAKE, Number.isFinite(base) ? base : MIN_STAKE));
   const legs = Math.max(1, Math.min(PREDICTION_COUNTS[PREDICTION_COUNTS.length - 1], Math.floor(count)));
   if (!weighted) return new Array<number>(legs).fill(clean);
-  const boosted = round2(Math.max(MIN_STAKE, clean + clean * 1.5));
+  const boosted = round2(Math.max(MIN_STAKE, clean * 1.5));
   const stakes = new Array<number>(legs).fill(clean);
   stakes[0] = boosted;
   return stakes;
@@ -273,6 +273,94 @@ export function streakMissProbability(combined: number, level: number): number {
 
 export function bundleTotal(stakes: readonly number[]): number {
   return round2(stakes.reduce((sum, stake) => sum + stake, 0));
+}
+
+export type SplitMode = "equal" | "weighted";
+
+/** Payout multiple used only for the Level-0 net-win estimate behind auto TP. */
+export const TP_PAYOUT_MULTIPLE = 8.85;
+
+export interface RiskPlanInput {
+  baseStake: number;
+  predictionCount: PredictionCount;
+  splitMode: SplitMode;
+  martingaleEnabled: boolean;
+  multiplier: number;
+  maxLevels: number;
+}
+
+export interface RiskLevel {
+  level: number;
+  stepStakePerDigit: number;
+  legOneStake: number;
+  stakes: number[];
+  bundleCost: number;
+  cumulativeRisk: number;
+}
+
+export interface RiskPlan {
+  levels: RiskLevel[];
+  effectiveMaxLevels: number;
+  effectiveMultiplier: number;
+  initialBundleCost: number;
+  rawCycleCost: number;
+  autoStopLoss: number;
+  initialLegOneStake: number;
+  estLevel0NetWin: number;
+  autoTakeProfit: number;
+  recommendedBuffer: number;
+}
+
+/**
+ * Builds the complete level ladder and the auto SL/TP pair from the same
+ * stakes the executor uses. Keeping one source of truth prevents a custom SL
+ * from being calculated against a smaller bundle than the one actually bought.
+ */
+export function computeRiskPlan(input: RiskPlanInput): RiskPlan {
+  const base = round2(Math.max(MIN_STAKE, Number.isFinite(input.baseStake) ? input.baseStake : MIN_STAKE));
+  const count = PREDICTION_COUNTS.includes(input.predictionCount) ? input.predictionCount : 3;
+  const weighted = input.splitMode === "weighted";
+  const cap = input.martingaleEnabled
+    ? Math.max(1, Math.min(MAX_MARTINGALE_LEVELS, Math.floor(Number.isFinite(input.maxLevels) ? input.maxLevels : 1)))
+    : 0;
+  const multiplier = input.martingaleEnabled
+    ? Math.min(MAX_MULTIPLIER, Math.max(MIN_MULTIPLIER, Number.isFinite(input.multiplier) ? input.multiplier : AUTO_MULTIPLIER[count]))
+    : 1;
+  let cumulative = 0;
+  const levels: RiskLevel[] = Array.from({ length: cap + 1 }, (_, level) => {
+    const stepStakePerDigit = round2(Math.max(MIN_STAKE, base * Math.pow(multiplier, level)));
+    const stakes = splitStakes(stepStakePerDigit, weighted, count);
+    const bundleCost = bundleTotal(stakes);
+    cumulative = round2(cumulative + bundleCost);
+    return {
+      level,
+      stepStakePerDigit,
+      legOneStake: stakes[0],
+      stakes,
+      bundleCost,
+      cumulativeRisk: cumulative,
+    };
+  });
+  const initialBundleCost = levels[0].bundleCost;
+  const rawCycleCost = round2(levels.reduce((sum, level) => sum + level.bundleCost, 0));
+  const autoStopLoss = round2(Math.ceil(rawCycleCost * 20 - 1e-9) / 20);
+  const initialLegOneStake = levels[0].legOneStake;
+  const estLevel0NetWin = round2(initialLegOneStake * TP_PAYOUT_MULTIPLE - initialBundleCost);
+  const rawTakeProfit = Math.max(estLevel0NetWin * 2, autoStopLoss * 0.65);
+  const autoTakeProfit = round2(Math.round(rawTakeProfit * 4) / 4);
+  const recommendedBuffer = round2(autoStopLoss * 3.5);
+  return {
+    levels,
+    effectiveMaxLevels: cap,
+    effectiveMultiplier: multiplier,
+    initialBundleCost,
+    rawCycleCost,
+    autoStopLoss,
+    initialLegOneStake,
+    estLevel0NetWin,
+    autoTakeProfit,
+    recommendedBuffer,
+  };
 }
 
 export function evaluateMesh(

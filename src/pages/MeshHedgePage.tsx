@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement, ReactNode } from "react";
 import type { Account, DerivSession, Quote, SymbolInfo, Tick } from "@/deriv";
 import TransitionMeshCircle from "@/components/TransitionMeshCircle";
+import SessionAdvisorModal from "@/components/SessionAdvisorModal";
+import type { SessionAdvisorState } from "@/components/SessionAdvisorModal";
 import {
   AUTO_MULTIPLIER,
   DEFAULT_DOMINANCE_PERCENT,
@@ -14,10 +16,10 @@ import {
   UNIFORM_BASELINE,
   bundleTotal,
   combinedProbability,
+  computeRiskPlan,
   decimalsFromPip,
   dominanceShare,
   evaluateMesh,
-  martingaleStake,
   nextMartingaleLevel,
   round2,
   splitStakes,
@@ -82,6 +84,15 @@ const SETTLEMENT_TIMEOUT_MS = 30000;
 function minRoundGapSec(legs: number): number {
   return Math.max(3, Math.ceil((4 * Math.max(1, legs) * 60) / 300));
 }
+
+const DEFAULT_RISK_PLAN = computeRiskPlan({
+  baseStake: MIN_STAKE,
+  predictionCount: 3,
+  splitMode: "equal",
+  martingaleEnabled: false,
+  multiplier: AUTO_MULTIPLIER[3],
+  maxLevels: 3,
+});
 
 const inputClass =
   "w-full rounded border border-line bg-ink px-2 py-1.5 font-mono text-xs text-slate-100 outline-none focus:border-accent disabled:opacity-50";
@@ -148,6 +159,14 @@ export default function MeshHedgePage(props: Props): ReactElement {
   const [rounds, setRounds] = useState<RoundRow[]>([]);
   const [wins, setWins] = useState(0);
   const [losses, setLosses] = useState(0);
+  const [peakLevel, setPeakLevel] = useState(0);
+  const [stopLoss, setStopLoss] = useState(DEFAULT_RISK_PLAN.autoStopLoss);
+  const [takeProfit, setTakeProfit] = useState(DEFAULT_RISK_PLAN.autoTakeProfit);
+  const [isSlManual, setIsSlManual] = useState(false);
+  const [isTpManual, setIsTpManual] = useState(false);
+  const [slFocused, setSlFocused] = useState(false);
+  const [tpFocused, setTpFocused] = useState(false);
+  const [advisor, setAdvisor] = useState<SessionAdvisorState | null>(null);
   const [payoutRatio, setPayoutRatio] = useState(ESTIMATED_PAYOUT);
   const [openLegs, setOpenLegs] = useState<Leg[] | null>(null);
   const [confirmMode, setConfirmMode] = useState<ConfirmMode | null>(null);
@@ -176,6 +195,11 @@ export default function MeshHedgePage(props: Props): ReactElement {
   const stakePerDigitRef = useRef(MIN_STAKE);
   const roundLevelRef = useRef(0);
   const pnlRef = useRef(0);
+  const winsRef = useRef(0);
+  const lossesRef = useRef(0);
+  const peakLevelRef = useRef(0);
+  const slRef = useRef(DEFAULT_RISK_PLAN.autoStopLoss);
+  const tpRef = useRef(DEFAULT_RISK_PLAN.autoTakeProfit);
   const roundNoRef = useRef(0);
   const legsRef = useRef<Map<number, Leg>>(new Map());
   const activeBundleIdsRef = useRef<Set<number>>(new Set());
@@ -196,6 +220,9 @@ export default function MeshHedgePage(props: Props): ReactElement {
   useEffect(() => { martingaleOnRef.current = martingaleOn; }, [martingaleOn]);
   useEffect(() => { martingaleLevelRef.current = martingaleLevel; }, [martingaleLevel]);
   useEffect(() => { maxLevelsRef.current = maxLevels; }, [maxLevels]);
+  useEffect(() => { slRef.current = stopLoss; }, [stopLoss]);
+  useEffect(() => { tpRef.current = takeProfit; }, [takeProfit]);
+  useEffect(() => { peakLevelRef.current = peakLevel; }, [peakLevel]);
   useEffect(() => { setRealOk(false); }, [accountId]);
   useEffect(() => {
     if (!thresholdLocked) setDominanceThreshold(DEFAULT_DOMINANCE_PERCENT[predictionCount]);
@@ -255,6 +282,40 @@ export default function MeshHedgePage(props: Props): ReactElement {
     setPhase(reason);
   }, []);
 
+  const showAdvisor = useCallback(
+    (
+      mode: SessionAdvisorState["mode"],
+      finalPnl: number,
+      finalWins: number,
+      finalLosses: number,
+      nextBundleCost?: number,
+    ) => {
+      armedRef.current = false;
+      coolingRef.current = false;
+      setArmed(false);
+      setMartingaleLevel(0);
+      martingaleLevelRef.current = 0;
+      setAdvisor({
+        mode,
+        pnl: finalPnl,
+        wins: finalWins,
+        losses: finalLosses,
+        peakLevel: peakLevelRef.current,
+        stopLoss: slRef.current,
+        takeProfit: tpRef.current,
+        nextBundleCost,
+      });
+      setPhase(
+        mode === "TP_HIT"
+          ? "Stopped: take profit hit"
+          : mode === "SL_ZERO_WINS"
+            ? "Stopped: stop loss (0 wins)"
+            : "Stopped: stop loss after wins",
+      );
+    },
+    [],
+  );
+
   const finalizeRound = useCallback(async () => {
     if (finalizingRef.current) return;
     finalizingRef.current = true;
@@ -267,12 +328,18 @@ export default function MeshHedgePage(props: Props): ReactElement {
     const total = bundleTotalRef.current;
     const nextPnl = round2(pnlRef.current + profit);
     pnlRef.current = nextPnl;
+    const nextWins = winsRef.current + (profit > 0 ? 1 : 0);
+    const nextLosses = lossesRef.current + (profit < 0 ? 1 : 0);
+    winsRef.current = nextWins;
+    lossesRef.current = nextLosses;
     roundNoRef.current += 1;
     const levelUsed = roundLevelRef.current;
     const nextLevel = martingaleOnRef.current
       ? nextMartingaleLevel(levelUsed, maxLevelsRef.current, profit < 0)
       : 0;
     martingaleLevelRef.current = nextLevel;
+    const peak = Math.max(peakLevelRef.current, levelUsed);
+    peakLevelRef.current = peak;
     const row: RoundRow = {
       id: roundNoRef.current,
       time: Date.now(),
@@ -287,8 +354,9 @@ export default function MeshHedgePage(props: Props): ReactElement {
     if (aliveRef.current) {
       setPnl(nextPnl);
       setMartingaleLevel(nextLevel);
-      setWins((value) => value + (profit > 0 ? 1 : 0));
-      setLosses((value) => value + (profit < 0 ? 1 : 0));
+      setWins(nextWins);
+      setLosses(nextLosses);
+      setPeakLevel(peak);
       setRounds((rows) => [row, ...rows].slice(0, 100));
       setOpenLegs(null);
     }
@@ -297,8 +365,21 @@ export default function MeshHedgePage(props: Props): ReactElement {
     legsRef.current.clear();
     roundLegsRef.current = [];
     settleProfitRef.current = 0;
+
+    const takeProfitHit = tpRef.current > 0 && nextPnl >= tpRef.current;
+    const stopLossHit = slRef.current > 0 && nextPnl <= -Math.abs(slRef.current);
+    const triggered = takeProfitHit || stopLossHit;
+    if ((takeProfitHit || stopLossHit) && aliveRef.current) {
+      showAdvisor(
+        takeProfitHit ? "TP_HIT" : nextWins === 0 ? "SL_ZERO_WINS" : "SL_PARTIAL_WINS",
+        nextPnl,
+        nextWins,
+        nextLosses,
+      );
+    }
+
     const wait = Math.max(cooldownRef.current, minRoundGapSec(legs.length || countRef.current));
-    if (wait > 0 && armedRef.current && aliveRef.current) {
+    if (!triggered && wait > 0 && armedRef.current && aliveRef.current) {
       coolingRef.current = true;
       for (let left = wait; left > 0 && armedRef.current && aliveRef.current; left -= 1) {
         setPhase("Cooldown (" + left + "s)");
@@ -310,8 +391,8 @@ export default function MeshHedgePage(props: Props): ReactElement {
     }
     finalizingRef.current = false;
     execRef.current = false;
-    if (aliveRef.current) setPhase(armedRef.current ? "Scanning ticks..." : "Paused");
-  }, [forgetSubscriptions]);
+    if (aliveRef.current && !triggered) setPhase(armedRef.current ? "Scanning ticks..." : "Paused");
+  }, [forgetSubscriptions, showAdvisor]);
 
   const handleContract = useCallback((payload: any) => {
     const id = Number(payload?.contract_id);
@@ -342,8 +423,31 @@ export default function MeshHedgePage(props: Props): ReactElement {
       execRef.current = false;
       return;
     }
-    execRef.current = true;
     const stakes = splitStakes(stakePerDigitRef.current, weightedRef.current, top.length);
+    const nextBundleCost = bundleTotal(stakes);
+    const projectedPnl = round2(pnlRef.current - nextBundleCost);
+    if (slRef.current > 0 && projectedPnl < -Math.abs(slRef.current) - 0.02) {
+      execRef.current = false;
+      showAdvisor(
+        winsRef.current === 0 ? "SL_ZERO_WINS" : "SL_PARTIAL_WINS",
+        pnlRef.current,
+        winsRef.current,
+        lossesRef.current,
+        nextBundleCost,
+      );
+      onNotice(
+        "Stop loss headroom guard: a " +
+          nextBundleCost.toFixed(2) +
+          " " +
+          currencyRef.current +
+          " bundle would take P/L to " +
+          projectedPnl.toFixed(2) +
+          " and breach your limit. No order was sent.",
+        "bad",
+      );
+      return;
+    }
+    execRef.current = true;
     const market = symbolRef.current;
     const cash = currencyRef.current;
     settleProfitRef.current = 0;
@@ -408,6 +512,8 @@ export default function MeshHedgePage(props: Props): ReactElement {
       legsRef.current.set(leg.id, leg);
     }
     roundLegsRef.current = legs;
+    peakLevelRef.current = Math.max(peakLevelRef.current, roundLevelRef.current);
+    if (aliveRef.current) setPeakLevel(peakLevelRef.current);
     bundleTotalRef.current = bundleTotal(legs.map((leg) => leg.stake));
     setOpenLegs(legs.slice());
     setPhase("Open: " + legs.length + " / " + top.length + " legs");
@@ -436,7 +542,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
         execRef.current = false;
       }, SETTLEMENT_TIMEOUT_MS);
     }
-  }, [forgetSubscriptions, onNotice, sessionRef, stopEngine]);
+  }, [forgetSubscriptions, onNotice, sessionRef, showAdvisor, stopEngine]);
 
   const maybeTrade = useCallback(async () => {
     if (!armedRef.current || execRef.current || coolingRef.current || finalizingRef.current) return;
@@ -614,13 +720,19 @@ export default function MeshHedgePage(props: Props): ReactElement {
     pnlRef.current = 0;
     roundNoRef.current = 0;
     settleProfitRef.current = 0;
+    winsRef.current = 0;
+    lossesRef.current = 0;
+    peakLevelRef.current = 0;
     setPnl(0);
     setRounds([]);
     setWins(0);
     setLosses(0);
+    setPeakLevel(0);
     setOpenLegs(null);
     setMartingaleLevel(0);
     martingaleLevelRef.current = 0;
+    setAdvisor(null);
+    setPhase("Session reset — start when ready");
   }, [stopEngine]);
 
   useEffect(() => {
@@ -667,17 +779,28 @@ export default function MeshHedgePage(props: Props): ReactElement {
         ? clamp(customMultiplier, MIN_MULTIPLIER, MAX_MULTIPLIER)
         : Number(multiplierChoice);
   const cleanBase = round2(Math.max(MIN_STAKE, baseStake));
-  const currentLevel = martingaleOn ? martingaleLevel : 0;
-  const stakePerDigit = martingaleOn
-    ? martingaleStake(cleanBase, activeMultiplier, currentLevel)
-    : cleanBase;
+  const riskPlan = useMemo(
+    () =>
+      computeRiskPlan({
+        baseStake: cleanBase,
+        predictionCount,
+        splitMode: weighted ? "weighted" : "equal",
+        martingaleEnabled: martingaleOn,
+        multiplier: activeMultiplier,
+        maxLevels,
+      }),
+    [activeMultiplier, cleanBase, martingaleOn, maxLevels, predictionCount, weighted],
+  );
+  const currentLevel = martingaleOn ? Math.min(martingaleLevel, riskPlan.effectiveMaxLevels) : 0;
+  const currentRisk = riskPlan.levels[currentLevel] ?? riskPlan.levels[0];
+  const stakePerDigit = currentRisk.stepStakePerDigit;
   const stakeCount = Math.max(1, top.length || predictionCount);
   const stakes = splitStakes(stakePerDigit, weighted, stakeCount);
   const bundle = bundleTotal(stakes);
   const minStake = Math.min(...stakes);
   const netIfHit = round2(payoutRatio * minStake - bundle);
-  const nextLevel = martingaleOn ? nextMartingaleLevel(currentLevel, maxLevels, true) : 0;
-  const nextStakePerDigit = martingaleOn ? martingaleStake(cleanBase, activeMultiplier, nextLevel) : cleanBase;
+  const nextLevel = martingaleOn ? nextMartingaleLevel(currentLevel, riskPlan.effectiveMaxLevels, true) : 0;
+  const nextStakePerDigit = (riskPlan.levels[nextLevel] ?? riskPlan.levels[0]).stepStakePerDigit;
   const nextStakes = splitStakes(nextStakePerDigit, weighted, stakeCount);
   const nextBundle = bundleTotal(nextStakes);
   const required = Math.max(...lookbacks);
@@ -687,21 +810,25 @@ export default function MeshHedgePage(props: Props): ReactElement {
   const minGap = minRoundGapSec(predictionCount);
   const dominancePass = combinedPct + 1e-9 >= dominanceThreshold;
 
-  let cumulativeRisk = 0;
-  const progression = Array.from({ length: maxLevels + 1 }, (_, level) => {
-    const perDigit = martingaleStake(cleanBase, activeMultiplier, level);
-    const rowStakes = splitStakes(perDigit, weighted, stakeCount);
-    const cost = bundleTotal(rowStakes);
-    cumulativeRisk = round2(cumulativeRisk + cost);
-    return {
-      level,
-      perDigit,
-      cost,
-      cumulative: cumulativeRisk,
-      netIfHit: round2(payoutRatio * Math.min(...rowStakes) - cost),
-      missStreak: streakMissProbability(combined, level) * 100,
-    };
-  });
+  const progression = riskPlan.levels.map((level) => ({
+    level: level.level,
+    perDigit: level.stepStakePerDigit,
+    cost: level.bundleCost,
+    cumulative: level.cumulativeRisk,
+    netIfHit: round2(payoutRatio * Math.min(...level.stakes) - level.bundleCost),
+    missStreak: streakMissProbability(combined, level.level) * 100,
+  }));
+
+  useEffect(() => {
+    if (isSlManual) return;
+    slRef.current = riskPlan.autoStopLoss;
+    setStopLoss(riskPlan.autoStopLoss);
+  }, [isSlManual, riskPlan.autoStopLoss]);
+  useEffect(() => {
+    if (isTpManual) return;
+    tpRef.current = riskPlan.autoTakeProfit;
+    setTakeProfit(riskPlan.autoTakeProfit);
+  }, [isTpManual, riskPlan.autoTakeProfit]);
 
   useEffect(() => { stakePerDigitRef.current = stakePerDigit; }, [stakePerDigit]);
 
@@ -952,6 +1079,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
           <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
             <Field label={"Base stake per digit (" + currency + ")"}>
               <input
+                id="mesh-base-stake"
                 type="number"
                 min={MIN_STAKE}
                 step={0.01}
@@ -1060,6 +1188,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
               )}
               <Field label={"Martingale max levels (1 - " + MAX_MARTINGALE_LEVELS + ")"}>
                 <input
+                  id="mesh-max-levels"
                   type="number"
                   min={1}
                   max={MAX_MARTINGALE_LEVELS}
@@ -1094,10 +1223,10 @@ export default function MeshHedgePage(props: Props): ReactElement {
                 </thead>
                 <tbody className="font-mono">
                   {progression.map((row) => {
-                    const active = row.level === (martingaleOn ? martingaleLevel : 0);
+                    const active = row.level === currentLevel;
                     return (
                       <tr key={row.level} className={"border-t border-line/60 " + (active ? "bg-accent/10 text-accent" : "text-slate-300")}>
-                        <td className="py-1 pr-2">L{row.level}{row.level === maxLevels ? " (cap)" : ""}</td>
+                        <td className="py-1 pr-2">L{row.level}{martingaleOn && row.level === riskPlan.effectiveMaxLevels ? " (cap)" : ""}</td>
                         <td className="py-1 pr-2">{row.perDigit.toFixed(2)}</td>
                         <td className="py-1 pr-2">{row.cost.toFixed(2)}</td>
                         <td className="py-1 pr-2">{row.cumulative.toFixed(2)}</td>
@@ -1110,17 +1239,100 @@ export default function MeshHedgePage(props: Props): ReactElement {
               </table>
             </div>
             <p className="mt-1 text-[9px] leading-relaxed text-muted">
-              Values in {currency}. Stake / Digit is the base step stake; Weighted boosts leg #1 by another 1.5x. Cumulative risk adds every bundle from Level 0 to that level. Streak odds use the current combined hit rate of the {top.length || predictionCount} selected digits and show the chance of missing that many rounds in a row. {martingaleOn ? "The highlighted row is the live level." : "Master OFF: only Level 0 is traded, the rest is preview."}
+              Values in {currency}. Stake / Digit is the base step stake; Weighted sets leg #1 to 1.5x it. Cumulative risk adds every bundle from Level 0 to that level. Streak odds use the current combined hit rate of the {top.length || predictionCount} selected digits and show the chance of missing that many rounds in a row. {martingaleOn ? "The highlighted row is the live level." : "Master OFF: only Level 0 is traded, so this table shows the single budgeted level."}
             </p>
           </div>
 
+          <div className="mt-4 rounded border border-line bg-ink/40 p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-200">Risk Controls — Auto Stop Loss / Take Profit</h3>
+                <p className="mt-1 text-[10px] text-muted">Calculated from the exact bundle ladder above. Auto values follow every base-stake, split, prediction-count, multiplier and max-level change. Typing pins a custom value until you reset it.</p>
+              </div>
+              <span className="rounded-full border border-line px-2 py-0.5 text-[9px] text-muted">{martingaleOn ? "1-cycle ladder: L0-L" + riskPlan.effectiveMaxLevels : "Martingale OFF: only L0"}</span>
+            </div>
+
+            <div className="mt-3 grid gap-2 sm:grid-cols-3">
+              <div className="rounded border border-line bg-panel/60 px-2.5 py-2">
+                <p className="text-[9px] uppercase tracking-widest text-muted">Initial bundle (L0)</p>
+                <p className="mt-0.5 font-mono text-sm text-slate-100">{riskPlan.initialBundleCost.toFixed(2)} {currency}</p>
+              </div>
+              <div className="rounded border border-line bg-panel/60 px-2.5 py-2">
+                <p className="text-[9px] uppercase tracking-widest text-muted">Full 1-cycle risk</p>
+                <p className="mt-0.5 font-mono text-sm text-amber-300">{riskPlan.rawCycleCost.toFixed(2)} {currency}</p>
+              </div>
+              <div className="rounded border border-line bg-panel/60 px-2.5 py-2">
+                <p className="text-[9px] uppercase tracking-widest text-muted">Recommended minimum buffer</p>
+                <p className="mt-0.5 font-mono text-sm text-slate-100">{riskPlan.recommendedBuffer.toFixed(2)} {currency}</p>
+              </div>
+            </div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <div className="rounded border border-line bg-panel/40 p-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label htmlFor="mesh-stop-loss" className="text-[10px] uppercase tracking-widest text-muted">Stop Loss ({currency})</label>
+                  <span className="flex items-center gap-2">
+                    <span className={"rounded-full px-2 py-0.5 text-[9px] font-semibold " + (isSlManual ? "bg-amber-400/15 text-amber-300" : "bg-accent/10 text-accent")}>{isSlManual ? "Custom" : "Auto (1-Cycle)"}</span>
+                    {isSlManual ? <button type="button" onClick={() => { setIsSlManual(false); setStopLoss(riskPlan.autoStopLoss); slRef.current = riskPlan.autoStopLoss; }} className="text-[9px] text-amber-300 underline decoration-dotted">Reset to Auto</button> : null}
+                  </span>
+                </div>
+                <input
+                  id="mesh-stop-loss"
+                  type="number"
+                  min={MIN_STAKE}
+                  step={0.05}
+                  value={slFocused ? stopLoss : stopLoss.toFixed(2)}
+                  disabled={armed || executing || !!openLegs}
+                  onFocus={() => setSlFocused(true)}
+                  onBlur={() => setSlFocused(false)}
+                  onChange={(event) => {
+                    const next = round2(Math.max(MIN_STAKE, Number(event.target.value) || MIN_STAKE));
+                    setIsSlManual(true);
+                    setStopLoss(next);
+                    slRef.current = next;
+                  }}
+                  className={inputClass + " mt-1"}
+                />
+                <p className="mt-1 text-[9px] leading-relaxed text-muted">Formula: full L0-L{riskPlan.effectiveMaxLevels} ladder, rounded up to the next 0.05. Auto now {riskPlan.autoStopLoss.toFixed(2)}; a losing bundle is blocked before it can breach this limit.</p>
+              </div>
+
+              <div className="rounded border border-line bg-panel/40 p-2.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label htmlFor="mesh-take-profit" className="text-[10px] uppercase tracking-widest text-muted">Take Profit ({currency})</label>
+                  <span className="flex items-center gap-2">
+                    <span className={"rounded-full px-2 py-0.5 text-[9px] font-semibold " + (isTpManual ? "bg-amber-400/15 text-amber-300" : "bg-accent/10 text-accent")}>{isTpManual ? "Custom" : "Auto (~2× Win)"}</span>
+                    {isTpManual ? <button type="button" onClick={() => { setIsTpManual(false); setTakeProfit(riskPlan.autoTakeProfit); tpRef.current = riskPlan.autoTakeProfit; }} className="text-[9px] text-amber-300 underline decoration-dotted">Reset to Auto</button> : null}
+                  </span>
+                </div>
+                <input
+                  id="mesh-take-profit"
+                  type="number"
+                  min={MIN_STAKE}
+                  step={0.05}
+                  value={tpFocused ? takeProfit : takeProfit.toFixed(2)}
+                  disabled={armed || executing || !!openLegs}
+                  onFocus={() => setTpFocused(true)}
+                  onBlur={() => setTpFocused(false)}
+                  onChange={(event) => {
+                    const next = round2(Math.max(MIN_STAKE, Number(event.target.value) || MIN_STAKE));
+                    setIsTpManual(true);
+                    setTakeProfit(next);
+                    tpRef.current = next;
+                  }}
+                  className={inputClass + " mt-1"}
+                />
+                <p className="mt-1 text-[9px] leading-relaxed text-muted">Formula: the larger of 2x the Level-0 net win or 65% of the stop loss, rounded to the nearest 0.25. Auto now {riskPlan.autoTakeProfit.toFixed(2)}; TP stops the engine and launches the cooldown advisor.</p>
+              </div>
+            </div>
+            <p className="mt-2 text-[9px] leading-relaxed text-muted">Auto SL uses the full K={predictionCount} ladder. A step that buys fewer legs still gets the same per-digit stake; the headroom guard checks the bundle actually about to be bought. Manual SL/TP are never overwritten by later stake or level changes.</p>
+          </div>
           <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-muted">
             <span className="rounded border border-line bg-ink px-2 py-1 font-mono">
               Legs {stakes.map((stake) => stake.toFixed(2)).join(" / ")} = {bundle.toFixed(2)} {currency}
             </span>
             <span>
-              {weighted ? "Weighted: leg #1 gets base + 1.5x, legs #2-" + predictionCount + " stay at base." : "Equal: every leg gets the base stake."}{" "}
-              {martingaleOn ? "Martingale ON at Level " + currentLevel + ", next bundle " + nextBundle.toFixed(2) + ", cap " + maxLevels + "." : "Martingale OFF, flat stake."} A {minGap}s floor keeps the K={predictionCount} proposal budget under Deriv's 360/min.
+              {weighted ? "Weighted: leg #1 gets 1.5x the per-digit stake, legs #2-" + predictionCount + " stay at that stake." : "Equal: every leg gets the base stake."}{" "}
+              {martingaleOn ? "Martingale ON at Level " + currentLevel + ", next bundle " + nextBundle.toFixed(2) + ", cap " + riskPlan.effectiveMaxLevels + "." : "Martingale OFF, flat stake; only Level 0 is budgeted."} A {minGap}s floor keeps the K={predictionCount} proposal budget under Deriv's 360/min.
             </span>
             <button type="button" onClick={resetSession} disabled={!!openLegs} className="ml-auto rounded border border-line px-3 py-1 text-[11px] text-muted hover:text-slate-100 disabled:opacity-40">Reset session</button>
           </div>
@@ -1149,6 +1361,10 @@ export default function MeshHedgePage(props: Props): ReactElement {
             <span className="mx-2 text-muted">·</span>
             Next Bundle Stake: {nextBundle.toFixed(2)} {currency}
             <span className="ml-2 text-[10px] text-muted">{martingaleOn ? "(if the next round misses)" : "(flat)"}</span>
+          </p>
+
+          <p className="mt-2 font-mono text-[10px] text-muted">
+            Stop Loss {stopLoss.toFixed(2)} ({isSlManual ? "Custom" : "Auto"}) · Take Profit {takeProfit.toFixed(2)} ({isTpManual ? "Custom" : "Auto"}) · Peak level L{peakLevel}
           </p>
 
           <p className="mt-3 text-[10px] leading-relaxed text-muted">
@@ -1209,6 +1425,8 @@ export default function MeshHedgePage(props: Props): ReactElement {
               <div><dt className="text-[10px] uppercase tracking-widest text-muted">Alignment gate</dt><dd>{gate}</dd></div>
               <div><dt className="text-[10px] uppercase tracking-widest text-muted">Dominance gate</dt><dd>{dominanceThreshold}%</dd></div>
               <div><dt className="text-[10px] uppercase tracking-widest text-muted">Martingale</dt><dd>{martingaleOn ? "ON · level " + martingaleLevel + " / " + maxLevels + " · " + activeMultiplier.toFixed(2) + "x" : "OFF (flat)"}</dd></div>
+              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Stop loss</dt><dd>{stopLoss.toFixed(2)} {currency} ({isSlManual ? "custom" : "auto"})</dd></div>
+              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Take profit</dt><dd>{takeProfit.toFixed(2)} {currency} ({isTpManual ? "custom" : "auto"})</dd></div>
             </dl>
             <label className="block text-[11px] text-muted">
               Type REAL to confirm
@@ -1234,6 +1452,14 @@ export default function MeshHedgePage(props: Props): ReactElement {
           </div>
         </Modal>
       ) : null}
+
+      <SessionAdvisorModal
+        open={advisor !== null}
+        state={advisor}
+        currency={currency}
+        onDismiss={() => setAdvisor(null)}
+        onReset={resetSession}
+      />
     </section>
   );
 }

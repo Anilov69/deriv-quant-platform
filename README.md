@@ -161,9 +161,9 @@ Stakes follow Deriv's **0.35 minimum per contract**:
 | Split | Leg #1 | Legs #2..K | Bundle at base 0.35 |
 | --- | --- | --- | --- |
 | Equal | base | base | K x base (1.05 for K=3, 1.75 for K=5) |
-| Weighted | base + 1.5 x base | base | 0.88 / 0.35 / 0.35 = 1.58 for K=3 |
+| Weighted | 1.5 × base | base | 0.53 / 0.35 / 0.35 = 1.23 for K=3 |
 
-With base 0.60 and K=3, weighted is 1.50 / 0.60 / 0.60 = 2.70. Every leg is
+With base 0.60 and K=3, weighted is 0.90 / 0.60 / 0.60 = 2.10. Every leg is
 rounded with `toFixed(2)` and clamped to 0.35. The normal single-quote path
 paces proposals 320 ms apart for the ladder; the hedge calls `quoteBundle`,
 which sends the K `proposal` frames as one burst inside the same rate budget,
@@ -178,6 +178,54 @@ legs. A full-miss round steps up; any winning round resets to Level 0; a loss at
 the cap also resets to Level 0. The table shows stake/digit, bundle, cumulative
 risk, net profit if hit and the probability of missing that many rounds in a row.
 Every history row and the CSV export carry the level used.
+
+### Auto stop loss, take profit and the session advisor
+
+The risk controls card derives both limits from the same ladder the executor
+uses, so a custom limit can never be calculated against a smaller bundle than
+the one actually bought. With `L = 0..effectiveMaxLevels`:
+
+```
+effectiveMaxLevels = martingaleOn ? maxLevels : 0
+effectiveMultiplier = martingaleOn ? multiplier : 1
+step(L) = +(base * effectiveMultiplier^L).toFixed(2)
+equalCost(L) = K * max(0.35, step(L))
+weightedCost(L) = max(0.35, +(step(L) * 1.5).toFixed(2)) + (K - 1) * max(0.35, step(L))
+rawCycleCost = sum(bundleCost(L))
+autoStopLoss = ceil(rawCycleCost * 20) / 20
+estLevel0NetWin = +(leg1Stake(0) * 8.85 - bundleCost(0)).toFixed(2)
+rawTakeProfit = max(estLevel0NetWin * 2, autoStopLoss * 0.65)
+autoTakeProfit = round(rawTakeProfit * 4) / 4
+recommendedBuffer = autoStopLoss * 3.5
+```
+
+A K=3 / 0.35 base / 1.6× / 2-level ladder costs 1.05 + 1.68 + 2.70 =
+5.43, so auto SL rounds up to **5.45** and auto TP is **4.00**. Raising max
+levels to 3 adds a 4.29 bundle: raw risk 9.72, auto SL **9.75**, auto TP **6.25**.
+With Martingale OFF (the shipped default) the ladder collapses to Level 0 even
+though Max Levels remains 3, so the page shows SL 1.05, TP 4.00 and a 3.68 buffer.
+
+Both fields are editable. Typing marks that field **Custom** and pins it across
+base-stake, split, K, multiplier and max-level changes; **Reset to Auto** restores
+the live formula. Inputs use the 0.35 minimum and 0.05 step. After every
+settled bundle the page updates P/L and counts a win when at least one leg hits
+and a loss only when every leg misses, then checks:
+
+- TP hit: `takeProfit > 0 && sessionPnL >= takeProfit` stops the engine, resets
+  the Martingale level to 0 and opens the green 5-minute `TP_HIT` advisor.
+- SL hit: `stopLoss > 0 && sessionPnL <= -abs(stopLoss)` does the same and opens
+  the amber 10-minute `SL_PARTIAL_WINS` modal when the session has wins, or the
+  red 15-minute `SL_ZERO_WINS` modal when it has none.
+- Headroom guard: before either a manual or auto bundle is priced, if
+  `sessionPnL - nextBundleCost < -abs(stopLoss) - 0.02`, the order is not sent.
+  The engine stops and the SL advisor explains that the next step would breach
+  the limit. This check is independent of manual/auto SL.
+
+The modal counts down live in MM:SS, disables its primary action until 00:00,
+and labels that action `Cooldown Active (MM:SS) — Wait Before Resuming`; at zero
+it becomes **Reset Session & Start Fresh**. **Dismiss & Review Charts** closes
+the modal without arming a trade, and resetting clears P/L, rounds, wins/losses
+and the peak level but preserves the chosen SL/TP fields.
 
 A round costs roughly 4K calls (proposal, buy, watch, forget), so the page floors
 the gap at 3 s for K=3 and 4 s for K=4-5. That keeps the connection near 240-300
@@ -213,14 +261,25 @@ account or the cap runs out.
 
 ### Verification
 
-`npm run typecheck`, `npm test` (83 tests across six files, 24 of them for the
-mesh maths, prediction scaling and martingale stakes) and `npm run build` pass
+`npm run typecheck`, `npm test` (87 tests across six files, 28 of them for the
+mesh maths, prediction scaling, risk plan and martingale stakes) and `npm run build` pass
 locally. The built `dist/` was loaded cold at `/#/mesh-hedge`: the 3/4/5 picker
 updates the Top-K heading, dominance gate, auto multiplier, bundle cost and
-progression table live; Weighted yields 0.88 / 0.35 / 0.35 / 0.35 / 0.35 at
+progression table live; Weighted yields 0.53 / 0.35 / 0.35 / 0.35 / 0.35 at
 K=5; locking the gate holds 40% across a K switch and Auto restores 58%; the
-martingale switch highlights the live row and projects the next bundle; no
-console errors. The three circles, the collecting banner and a seeded 300-tick
+martingale switch highlights the live row and projects the next bundle; with
+Martingale ON, changing base stake and max levels moves the auto SL/TP and the
+ladder together; no
+console errors. At 0.60 base / K=3 / max 3 / Martingale ON the card shows SL
+16.70 and TP 10.75; lowering max levels to 2 gives SL 9.30 and TP 7.00; K=5 at
+0.50 base / max 2 gives SL 22.90 and TP 15.00; Weighted K=5 instead gives SL
+25.20, TP 16.50 and legs 0.75 / 0.50 / 0.50 / 0.50 / 0.50. Typing a 20.00 SL
+keeps it through a 0.60 → 0.50 base change while TP auto-updates to 5.75;
+**Reset to Auto** restores the computed 7.75. All three advisor modes were
+rendered with live 05:00 / 10:00 / 15:00 countdowns, disabled primary actions,
+the exact headline/badge/action copy, and a primary that becomes **Reset Session &
+Start Fresh** at 00:00; the action bar stays pinned while the message scrolls.
+The three circles, the collecting banner and a seeded 300-tick
 buffer still render the expected colours and triple-alignment banner. The
 funded execution path remains code-reviewed and unit-tested at the maths and
 transport layers, but it has not been run against a funded account.

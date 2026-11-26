@@ -1,0 +1,243 @@
+import { useEffect, useRef, useState } from 'react';
+import type { ReactElement, ReactNode } from 'react';
+
+export type SessionAdvisorMode = 'TP_HIT' | 'SL_PARTIAL_WINS' | 'SL_ZERO_WINS';
+
+export interface SessionAdvisorState {
+  mode: SessionAdvisorMode;
+  pnl: number;
+  wins: number;
+  losses: number;
+  peakLevel: number;
+  stopLoss: number;
+  takeProfit: number;
+  /** Set when the pre-trade headroom guard blocked the next bundle. */
+  nextBundleCost?: number;
+}
+
+interface Props {
+  open: boolean;
+  state: SessionAdvisorState | null;
+  currency: string;
+  onDismiss: () => void;
+  onReset: () => void;
+}
+
+interface AdvisorConfig {
+  durationSec: number;
+  badge: string;
+  action: string;
+  message: string;
+  bullets: string[];
+  shell: string;
+  badgeTone: string;
+  accent: string;
+  primary: string;
+}
+
+const CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
+  TP_HIT: {
+    durationSec: 300,
+    badge: 'TAKE PROFIT HIT',
+    action: 'Stop Trading for 5 Minutes',
+    message:
+      'You captured a clean positive variance run and hit your Take Profit target. Because Deriv\'s RNG has zero memory, staying in immediately exposes your banked profit to a random cold streak. Step away for 5 minutes, let the market cycle, and consider securing your profit before starting a fresh session at your base stake.',
+    bullets: [
+      'Keep your next session at your base stake—never double up just because you won.',
+      'Review your Round History or export your CSV log while the 5-minute timer cools down.',
+    ],
+    shell: 'border-accent/60',
+    badgeTone: 'bg-accent text-ink',
+    accent: 'text-accent',
+    primary: 'bg-accent text-ink hover:bg-accent/90',
+  },
+  SL_PARTIAL_WINS: {
+    durationSec: 600,
+    badge: 'STOP LOSS — PARTIAL WINS',
+    action: 'Pause Trading for 10 Minutes',
+    message:
+      "Your 1-cycle Stop Loss did its exact job—it cut off a cold streak before it could bleed into a second Martingale cycle. Even after earlier wins, a 3- or 4-round miss is normal statistical variance on a random generator. Step away for 10 minutes so you don't revenge-trade.",
+    bullets: [
+      'Do not increase your base stake or Max Levels to try to win it back faster.',
+      'Confirm your remaining wallet still holds at least 3× your 1-cycle Stop Loss before resuming.',
+    ],
+    shell: 'border-amber-400/60',
+    badgeTone: 'bg-amber-400 text-ink',
+    accent: 'text-amber-300',
+    primary: 'bg-amber-400 text-ink hover:bg-amber-300',
+  },
+  SL_ZERO_WINS: {
+    durationSec: 900,
+    badge: 'STOP LOSS — ZERO WINS',
+    action: 'Step Away for 15 Minutes (or Switch to Demo)',
+    message:
+      "You ran straight into an immediate cold cluster from Level 0 through your Martingale cap without a single hit. On a 3-digit hedge, losing 3 to 4 rounds in a row happens ~24%–34% of the time purely by chance—it does not mean the bot is broken, and it does not mean a win is 'due' next tick. Take a 15-minute break to clear any frustration before placing another trade.",
+    bullets: [
+      'Never immediately restart at a higher stake after a 0-win stop-out—that is the #1 cause of blown accounts.',
+      'After the 15-minute cooldown, check that your symbol is a fast 1s index (1HZ100V / 1HZ75V), verify dominance is at least 36%–40%, and run 3 test rounds on Demo if you want to verify flow before going back to Real.',
+    ],
+    shell: 'border-danger/60',
+    badgeTone: 'bg-danger text-ink',
+    accent: 'text-danger',
+    primary: 'bg-danger text-ink hover:bg-danger/90',
+  },
+};
+
+function formatClock(totalSeconds: number): string {
+  const safe = Math.max(0, Math.ceil(totalSeconds));
+  const minutes = Math.floor(safe / 60);
+  const seconds = safe % 60;
+  return String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+}
+
+function Money({ value, currency }: { value: number; currency: string }): ReactElement {
+  return <>{value.toFixed(2)} {currency}</>;
+}
+
+function Stat({ label, children }: { label: string; children: ReactNode }): ReactElement {
+  return (
+    <div className='rounded border border-line bg-ink/60 px-3 py-2'>
+      <dt className='text-[9px] uppercase tracking-widest text-muted'>{label}</dt>
+      <dd className='mt-0.5 font-mono text-sm text-slate-100'>{children}</dd>
+    </div>
+  );
+}
+
+export default function SessionAdvisorModal({ open, state, currency, onDismiss, onReset }: Props): ReactElement | null {
+  const duration = state ? CONFIG[state.mode].durationSec : 0;
+  const [left, setLeft] = useState(duration);
+  const deadlineRef = useRef(0);
+
+  useEffect(() => {
+    if (!open || !state) return;
+    const total = CONFIG[state.mode].durationSec;
+    setLeft(total);
+    deadlineRef.current = Date.now() + total * 1000;
+    let intervalId = 0;
+    const tick = () => {
+      const next = Math.max(0, Math.ceil((deadlineRef.current - Date.now()) / 1000));
+      setLeft(next);
+      if (next === 0) window.clearInterval(intervalId);
+    };
+    intervalId = window.setInterval(tick, 250);
+    tick();
+    return () => window.clearInterval(intervalId);
+  }, [open, state?.mode]);
+
+  if (!open || !state) return null;
+  const config = CONFIG[state.mode];
+  const locked = left > 0;
+  const signed = (state.pnl >= 0 ? '+' : '-') + '$' + Math.abs(state.pnl).toFixed(2);
+  const headline =
+    state.mode === 'TP_HIT'
+      ? 'Target Locked! ' + signed + ' Banked'
+      : state.mode === 'SL_PARTIAL_WINS'
+        ? 'Stop Loss Triggered (' + signed + ') — Capital Protected'
+        : 'Cold-Start Stop Loss (' + signed + ' · 0 Wins) — Hard Pause';
+
+  return (
+    <div className='fixed inset-0 z-[60] flex items-center justify-center bg-black/80 p-3 sm:p-5' role='presentation'>
+      <div
+        role='dialog'
+        aria-modal='true'
+        aria-labelledby='advisor-headline'
+        className={'max-h-[92vh] w-full max-w-2xl overflow-y-auto overscroll-contain rounded-lg border bg-panel p-4 shadow-2xl sm:p-5 ' + config.shell}
+      >
+        <div className='flex items-start justify-between gap-3'>
+          <div>
+            <span className={'inline-flex rounded-full px-2.5 py-1 text-[9px] font-bold uppercase tracking-widest ' + config.badgeTone}>
+              {config.badge}
+            </span>
+            <h2 id='advisor-headline' className={'mt-2 text-xl font-semibold tracking-tight ' + config.accent}>
+              {headline}
+            </h2>
+          </div>
+          <button
+            type='button'
+            onClick={onDismiss}
+            aria-label='Dismiss session advisor'
+            className='rounded border border-line px-2 py-1 text-xs text-muted hover:text-slate-100'
+          >
+            Close
+          </button>
+        </div>
+
+        <dl className='mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4'>
+          <Stat label='Final session P/L'>
+            <span className={state.pnl >= 0 ? 'text-accent' : 'text-danger'}>
+              {state.pnl >= 0 ? '+' : '-'}<Money value={Math.abs(state.pnl)} currency={currency} />
+            </span>
+          </Stat>
+          <Stat label='Rounds played'>
+            {state.wins + state.losses} <span className='text-[10px] text-muted'>({state.wins} W / {state.losses} L)</span>
+          </Stat>
+          <Stat label='Peak martingale'>L{state.peakLevel}</Stat>
+          <Stat label='Session limits'>
+            <span className='text-[10px]'>SL {state.stopLoss.toFixed(2)} / TP {state.takeProfit.toFixed(2)}</span>
+          </Stat>
+        </dl>
+
+        {state.nextBundleCost !== undefined ? (
+          <p className='mt-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger'>
+            Headroom guard: no order was sent. The next bundle was <Money value={state.nextBundleCost} currency={currency} />. Losing it would breach your active Stop Loss, so the bot stopped before risking more capital.
+          </p>
+        ) : null}
+
+        <div className={'mt-4 rounded border border-line bg-ink/50 p-3 ' + config.shell}>
+          <div className='flex flex-wrap items-end justify-between gap-3'>
+            <div>
+              <p className='text-[9px] uppercase tracking-widest text-muted'>Discipline cooldown</p>
+              <p className='font-mono text-3xl text-slate-100' aria-live='polite'>{formatClock(left)}</p>
+            </div>
+            <p className={'max-w-[260px] text-right text-[11px] font-semibold leading-snug ' + config.accent}>
+              Recommended action: {config.action}
+            </p>
+          </div>
+          <p className='mt-2 text-[10px] leading-relaxed text-muted'>
+            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the mesh and history without arming another trade.
+          </p>
+        </div>
+
+        <blockquote className='mt-4 border-l-2 border-line pl-3 text-[11px] leading-relaxed text-slate-300'>
+          <p className='mb-1 text-[9px] uppercase tracking-widest text-muted'>Advisor message</p>
+          {config.message}
+        </blockquote>
+
+        <div className='mt-4'>
+          <p className='text-[9px] uppercase tracking-widest text-muted'>Checklist</p>
+          <ul className='mt-1 space-y-1.5 text-[11px] leading-relaxed text-slate-300'>
+            {config.bullets.map((bullet) => (
+              <li key={bullet} className='flex gap-2'>
+                <span className={'mt-0.5 ' + config.accent}>•</span>
+                <span>{bullet}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+
+        <div className='sticky bottom-0 -mx-4 mt-5 border-t border-line bg-panel px-4 pb-1 pt-3 shadow-[0_-10px_24px_rgba(0,0,0,0.35)] sm:-mx-5 sm:px-5'>
+          <div className='flex flex-col-reverse gap-2 sm:flex-row sm:justify-end'>
+            <button
+              type='button'
+              onClick={onDismiss}
+              className='rounded border border-line px-3 py-2 text-xs font-medium text-muted hover:text-slate-100'
+            >
+              Dismiss & Review Charts
+            </button>
+            <button
+              type='button'
+              onClick={onReset}
+              disabled={locked}
+              className={'rounded px-3 py-2 text-xs font-semibold disabled:cursor-not-allowed disabled:opacity-50 ' + config.primary}
+            >
+              {locked ? 'Cooldown Active (' + formatClock(left) + ') — Wait Before Resuming' : 'Reset Session & Start Fresh'}
+            </button>
+          </div>
+          <p className='mt-2 text-right text-[9px] text-muted'>
+            Review the session before resuming. This modal does not place orders.
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
