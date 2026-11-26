@@ -377,6 +377,17 @@ export default function GapEnginePage(props: Props): ReactElement {
     };
   }, [attemptTrade, connected, onNotice, sessionRef, symbol]);
 
+  useEffect(() => {
+    if (!connected && runningRef.current) stopBot("Paused: connection closed");
+  }, [connected, stopBot]);
+
+  const accountRef = useRef(accountId);
+  useEffect(() => {
+    if (accountRef.current === accountId) return;
+    accountRef.current = accountId;
+    if (runningRef.current) stopBot("Paused after account change");
+  }, [accountId, stopBot]);
+
   useEffect(() => () => {
     runningRef.current = false;
   }, []);
