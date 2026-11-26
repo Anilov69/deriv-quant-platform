@@ -162,6 +162,7 @@ export default function GapEnginePage(props: Props): ReactElement {
   const currencyRef = useRef(currency);
   const settleRef = useRef<{ id: number; resolve: (payload: any) => void } | null>(null);
   const historyIdRef = useRef(0);
+  const aliveRef = useRef(true);
 
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { symbolRef.current = symbol; }, [symbol]);
@@ -229,8 +230,10 @@ export default function GapEnginePage(props: Props): ReactElement {
       });
       subscriptionId = await session.watch(contractId);
       const payload = await settled;
+      if (!aliveRef.current) return;
       if (!payload) throw new Error("Deriv did not settle the contract within 180 s.");
       const profit = Number(payload.profit ?? 0);
+      const tradeLevel = stepRef.current;
       const newPnl = Math.round((pnlRef.current + profit) * 100) / 100;
       pnlRef.current = newPnl;
       setPnl(newPnl);
@@ -270,7 +273,7 @@ export default function GapEnginePage(props: Props): ReactElement {
         stake: quote.ask,
         payout: quote.payout,
         profit,
-        level: stepRef.current,
+        level: tradeLevel,
       };
       setHistory((rows) => [row, ...rows].slice(0, 300));
       if (newPnl >= cfg.takeProfit) {
@@ -289,8 +292,10 @@ export default function GapEnginePage(props: Props): ReactElement {
         if (runningRef.current) setPhase("Scanning ticks...");
       }
     } catch (error) {
-      stopBot("Stopped: " + (error as Error).message);
-      onNotice((error as Error).message, "bad");
+      if (aliveRef.current) {
+        stopBot("Stopped: " + (error as Error).message);
+        onNotice((error as Error).message, "bad");
+      }
     } finally {
       settleRef.current = null;
       if (subscriptionId) void session.forget(subscriptionId);
@@ -388,8 +393,15 @@ export default function GapEnginePage(props: Props): ReactElement {
     if (runningRef.current) stopBot("Paused after account change");
   }, [accountId, stopBot]);
 
-  useEffect(() => () => {
-    runningRef.current = false;
+  useEffect(() => {
+    aliveRef.current = true;
+    return () => {
+      aliveRef.current = false;
+      runningRef.current = false;
+      const pending = settleRef.current;
+      settleRef.current = null;
+      pending?.resolve(null);
+    };
   }, []);
 
   const stats = useMemo(() => classifyGap(buffer, settings.lookback), [buffer, settings.lookback]);
