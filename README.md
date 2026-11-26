@@ -100,6 +100,98 @@ timeout that stops the bot instead of trading blind. Take-profit / stop-loss are
 checked on the settled `profit`; a REAL account needs the confirmation dialog
 and the word `REAL`.
 
+## Mesh Hedge (`#/mesh-hedge`)
+
+A third page in the same shell, at `/#/mesh-hedge`, with the same hash routing,
+session, balance stream and Demo/Real switch. It keeps one rolling buffer of the
+last 300 formatted digits, seeded by `ticks_history count 300` and extended by a
+second tick subscription, so the three windows are warm the moment the page opens.
+
+**Digits are read from the formatted quote.** The precision comes from the
+symbol's `pip_size`, the quote is rendered with `toFixed(decimalPlaces)` and only
+then is the last character taken. Slicing a raw JS number would turn `1234.50`
+into `1234.5` and report `5` instead of `0`.
+
+### Three transition meshes
+
+Each of the three SVG circles has an editable lookback (100 / 150 / 200 by
+default, 20–300). Nodes show the digit, its count and its share; the live last
+digit sits in the centre. Directed lines are drawn only for transitions that were
+actually observed, with stroke width proportional to the count, and the lines
+leaving the current digit are highlighted. Nodes are coloured green for the
+window's hottest digit, blue for the runner-up, pink for the coldest and slate
+for everything else.
+
+The consensus banner compares the three leaders: three greens is **triple
+alignment**, two greens plus a blue runner-up in the third window is **strong
+consensus**, anything else is **divergent**. The optional alignment gate can
+require strong or triple before a round, but it defaults to "any" so the hedge is
+not silently disabled.
+
+### Hybrid score and the 3-digit bundle
+
+```
+S(j) = 0.60 * f_bar_windows(j) + 0.40 * P(d(t+1) = j | d(t))
+```
+
+`f_bar` is the digit's share averaged across the three windows and normalised,
+`P(next | current)` is the empirical transition row of the largest window. On
+step symbols, a digit whose observed transition probability is zero is forced to
+score zero, because the step generator cannot reach it from the current digit.
+The page shows the top three with their individual probabilities, the combined
+`P1 + P2 + P3`, the combined dominance share against the 30% uniform baseline,
+and the projected net if any single leg hits (payout multiple read from the last
+executed quotes, 8.93x until then).
+
+Stakes follow Deriv's **0.35 minimum per contract**:
+
+| Split | Leg #1 | Leg #2 | Leg #3 | Bundle |
+| --- | --- | --- | --- | --- |
+| Flat | base | base | base | 3 x base (1.05 at the minimum) |
+| Weighted | base | 0.35 | 0.35 | base + 0.70 (0.60 / 0.35 / 0.35 = 1.30) |
+
+All three legs go to `toFixed(2)`. The normal single-quote path paces proposals
+320 ms apart for the ladder; the hedge instead calls `quoteBundle`, which sends
+the three `proposal` frames as one burst inside the same rate budget, and then
+buys them with one `Promise.all`. A buy needs the proposal id and its price, so
+the request is `{ buy: <id>, price: <ask> }`, not the legacy parameter block.
+
+A round costs 3 proposals, 3 buys, 3 watches and 3 forgets, so the page keeps a
+3 s floor between rounds even when the cooldown is set lower. That holds the
+connection at roughly 240 calls/min against Deriv's 360/min budget. A pricing
+failure stops the hedge instead of retrying into the limit.
+
+### Locking and settlement
+
+The bundle lock is a `Set<number>` of live contract ids. Every bought contract is
+added before its `proposal_open_contract` subscription starts, removed only when
+that contract reports `is_sold === 1`, and the execution lock stays closed until
+the set is empty **and** the post-round cooldown has finished. A 30 s timeout
+stops the bot and forgets the subscriptions instead of guessing a result; a
+partial buy (one or two legs rejected) is recorded as what actually filled, never
+as the intended three.
+
+Step indices do not quote `DIGITMATCH` on the live API today, so selecting
+`stpRNG` will usually end with all three legs rejected and no position. The page
+keeps the family because the spec asks for it, filters unreachable digits, and
+says so instead of pretending a contract exists.
+
+Hedging three digits does not create an edge. At a fair 10% per digit the flat
+bundle hits 30% of the time; an 8.93x payout on the 1.05 bundle returns about
+0.94, so the expected loss is roughly 0.11 per round. A hit does pay (3.13 back
+for 1.05 staked), which is exactly what makes the losing rounds look rare. The
+mesh changes which digits are chosen; it cannot change the house price.
+
+### Verification
+
+`npm run typecheck`, `npm test` (79 tests across six files, 20 of them for the
+mesh maths) and `npm run build` pass locally. The built `dist/` was loaded cold
+at `/#/mesh-hedge` and through the nav links; the three circles, the collecting
+banner and the empty state render with no console errors, and a seeded 300-tick
+buffer produces the expected colours, outgoing arrows and triple-alignment
+banner. The execution path is code-reviewed and unit-tested at the maths and
+transport layers, but it has not been run against a funded account.
+
 ## Auto-trade and martingale
 
 Arming **AUTO-TRADE** turns the ladder from a table into an execution loop:

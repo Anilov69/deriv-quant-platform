@@ -38,6 +38,15 @@ export interface Quote {
   payout: number;
 }
 
+export interface QuoteRequest {
+  symbol: string;
+  contract: string;
+  barrier?: string;
+  duration: number;
+  stake: number;
+  currency: string;
+}
+
 export interface Contract {
   id: number;
   symbol: string;
@@ -355,14 +364,7 @@ export class DerivSession {
     await this.send({ balance: 1, subscribe: 1 });
   }
 
-  async quote(input: {
-    symbol: string;
-    contract: string;
-    barrier?: string;
-    duration: number;
-    stake: number;
-    currency: string;
-  }): Promise<Quote> {
+  private proposalPayload(input: QuoteRequest): Record<string, unknown> {
     const payload: Record<string, unknown> = {
       proposal: 1,
       amount: input.stake,
@@ -374,12 +376,46 @@ export class DerivSession {
       underlying_symbol: input.symbol,
     };
     if (input.barrier !== undefined) payload.barrier = input.barrier;
-    const message = await this.sendProposal(payload);
+    return payload;
+  }
+
+  private toQuote(message: any): Quote {
     const proposal = message?.proposal;
     const ask = num(proposal?.ask_price);
     const payout = num(proposal?.payout);
     if (!proposal?.id || ask <= 0 || payout <= 0) throw new DerivError("NoQuote", "Deriv returned no usable quote.");
     return { id: String(proposal.id), ask, payout };
+  }
+
+  async quote(input: QuoteRequest): Promise<Quote> {
+    return this.toQuote(await this.sendProposal(this.proposalPayload(input)));
+  }
+
+  /**
+   * A simultaneous proposal burst for a hedged bundle. The single-quote path
+   * paces proposals 320 ms apart for the ladder, but a 3-leg DIGITMATCH hedge
+   * must price on one tick, so these proposals are sent back to back (still
+   * inside Deriv's 360/min budget) and the caller buys them in one Promise.all.
+   */
+  async quoteBundle(requests: QuoteRequest[]): Promise<Quote[]> {
+    if (requests.length === 0) return [];
+    const wait = Math.max(this.proposalPausedUntil - Date.now(), 0);
+    if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
+    this.lastProposalAt = Date.now();
+    const messages = await Promise.all(
+      requests.map(async (input) => {
+        try {
+          return await this.send(this.proposalPayload(input));
+        } catch (error) {
+          if (isRateLimit(error)) {
+            this.proposalPausedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
+            throw new DerivError("RateLimit", "Deriv rate-limited the 3-leg proposal burst; pausing.", 0);
+          }
+          throw error;
+        }
+      }),
+    );
+    return messages.map((message) => this.toQuote(message));
   }
 
   private sendProposal(payload: Record<string, unknown>): Promise<any> {

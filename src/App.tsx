@@ -8,6 +8,7 @@ import { AutoTrader } from "@/autotrade";
 import type { Snapshot } from "@/autotrade";
 import AutoTradePanel from "@/AutoTradePanel";
 import GapEnginePage from "@/pages/GapEnginePage";
+import MeshHedgePage from "@/pages/MeshHedgePage";
 import {
   digitsFrom,
   entropyBits,
@@ -32,12 +33,14 @@ interface Notice {
   text: string;
 }
 
-type Route = "home" | "gap";
+type Route = "home" | "gap" | "mesh";
 
 /** GitHub Pages has no server-side routing, so the page lives in the hash. */
 function readRoute(): Route {
   const path = window.location.hash.replace(/^#\/?/, "").split("?")[0];
-  return path === "gap-engine" ? "gap" : "home";
+  if (path === "gap-engine") return "gap";
+  if (path === "mesh-hedge") return "mesh";
+  return "home";
 }
 
 function readStore(store: Storage): StoredCredentials | null {
@@ -155,6 +158,7 @@ export default function App(): ReactElement {
   const quotingRef = useRef(false);
   const routeRef = useRef<Route>(route);
   const gapContractRef = useRef<((payload: any) => void) | null>(null);
+  const meshContractRef = useRef<((payload: any) => void) | null>(null);
 
   useEffect(() => {
     routeRef.current = route;
@@ -186,6 +190,7 @@ export default function App(): ReactElement {
     session.onContract = (payload) => {
       autoRef.current?.onContractUpdate(payload);
       gapContractRef.current?.(payload);
+      meshContractRef.current?.(payload);
       if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
@@ -231,6 +236,10 @@ export default function App(): ReactElement {
     gapContractRef.current = handler;
   }, []);
 
+  const bindMeshContractListener = useCallback((handler: ((payload: any) => void) | null) => {
+    meshContractRef.current = handler;
+  }, []);
+
   const switchAccount = useCallback((next: string) => {
     const session = sessionRef.current;
     if (!session || !next || next === accountId) return;
@@ -242,7 +251,7 @@ export default function App(): ReactElement {
   }, [accountId]);
 
   useEffect(() => {
-    if (route === "gap") autoRef.current?.stop("Terminal panel closed");
+    if (route !== "home") autoRef.current?.stop("Terminal panel closed");
   }, [route]);
 
   useEffect(() => {
@@ -492,6 +501,9 @@ export default function App(): ReactElement {
           <a href="#/gap-engine" className={"rounded px-2 py-1 " + (route === "gap" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Gap Engine
           </a>
+          <a href="#/mesh-hedge" className={"rounded px-2 py-1 " + (route === "mesh" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Mesh Hedge
+          </a>
         </nav>
         <div className="flex items-center gap-3 text-xs">
           <span className={"rounded-full border px-3 py-1 " + (live ? "border-accent/40 text-accent" : status === "error" ? "border-danger/40 text-danger" : "border-line text-muted")}>
@@ -585,6 +597,21 @@ export default function App(): ReactElement {
           onAccountChange={switchAccount}
           onNotice={notify}
           bindContractListener={bindContractListener}
+        />
+      ) : route === "mesh" ? (
+        <MeshHedgePage
+          sessionRef={sessionRef}
+          connected={live}
+          symbols={symbols}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindMeshContractListener}
         />
       ) : (
         <>
