@@ -395,33 +395,44 @@ export default function MeshHedgePage(props: Props): ReactElement {
     setQuotes([]);
     let cancelled = false;
     let subscriptionId = "";
-    session.onTickFor = (market, tick: Tick) => {
-      if (cancelled || market !== symbolRef.current) return;
-      const next = [...quotesRef.current, tick.quote].slice(-300);
-      quotesRef.current = next;
-      setQuotes(next);
-      void maybeTrade();
+
+    const listen = () => {
+      if (cancelled) return;
+      session.onTickFor = (market, tick: Tick) => {
+        if (cancelled || market !== symbolRef.current) return;
+        const next = [...quotesRef.current, tick.quote].slice(-300);
+        quotesRef.current = next;
+        setQuotes(next);
+        void maybeTrade();
+      };
+      session
+        .subscribeTicksFor(symbol)
+        .then((id) => {
+          if (cancelled) void session.forget(id);
+          else subscriptionId = id;
+        })
+        .catch((error: Error) => {
+          if (aliveRef.current) onNotice(error.message, "bad");
+        });
     };
-    session.subscribeTicksFor(symbol)
-      .then((id) => {
-        if (cancelled) void session.forget(id);
-        else subscriptionId = id;
-      })
-      .catch((error: Error) => {
-        if (aliveRef.current) onNotice(error.message, "bad");
-      });
-    session.history(symbol, 300)
+
+    // Seed first, then listen: a live tick that lands during the history
+    // request cannot be overwritten by the seed.
+    session
+      .history(symbol, 300)
       .then((list) => {
         if (cancelled) return;
         const next = list.map((item) => item.quote).slice(-300);
         quotesRef.current = next;
         setQuotes(next);
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(listen);
+
     return () => {
       cancelled = true;
       session.onTickFor = null;
-      void session.forget(subscriptionId);
+      if (subscriptionId) void session.forget(subscriptionId);
     };
   }, [connected, maybeTrade, onNotice, sessionRef, symbol]);
 
