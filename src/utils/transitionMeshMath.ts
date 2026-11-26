@@ -51,6 +51,40 @@ export interface MeshEvaluation {
 export const MIN_STAKE = 0.35;
 export const UNIFORM_THREE_DIGIT = 0.3;
 
+export const PREDICTION_COUNTS = [3, 4, 5] as const;
+export type PredictionCount = (typeof PREDICTION_COUNTS)[number];
+
+/** Default minimum combined P(hit) gate, scaled with the number of picks. */
+export const DEFAULT_DOMINANCE_PERCENT: Record<PredictionCount, number> = {
+  3: 36,
+  4: 47,
+  5: 58,
+};
+
+/** Uniform random hit rate for K picks out of ten digits. */
+export const UNIFORM_BASELINE: Record<PredictionCount, number> = {
+  3: 0.3,
+  4: 0.4,
+  5: 0.5,
+};
+
+/** Auto-matched recovery multiplier, smaller as coverage gets wider. */
+export const AUTO_MULTIPLIER: Record<PredictionCount, number> = {
+  3: 1.6,
+  4: 1.9,
+  5: 2.4,
+};
+
+export const ROI_BADGE: Record<PredictionCount, string> = {
+  3: "Sweet Spot · ~197% ROI",
+  4: "Balanced · ~123% ROI",
+  5: "High Coverage · ~78% ROI",
+};
+
+export const MAX_MARTINGALE_LEVELS = 6;
+export const MIN_MULTIPLIER = 1.1;
+export const MAX_MULTIPLIER = 5;
+
 export function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
@@ -195,14 +229,46 @@ export function combinedProbability(top: RankedDigit[]): number {
   return top.reduce((sum, entry) => sum + entry.transition, 0);
 }
 
-export function dominanceShare(combined: number): number {
-  return combined / UNIFORM_THREE_DIGIT;
+export function dominanceShare(combined: number, baseline = UNIFORM_THREE_DIGIT): number {
+  if (!Number.isFinite(baseline) || baseline <= 0) return 0;
+  return combined / baseline;
 }
 
-export function splitStakes(base: number, weighted: boolean): [number, number, number] {
+/**
+ * Flat: every leg at the per-digit stake.
+ * Weighted: leg #1 gets a further 1.5x of the per-digit stake; legs #2..K stay
+ * at the per-digit stake. Every leg is clamped to the 0.35 Deriv minimum.
+ */
+export function splitStakes(base: number, weighted: boolean, count = 3): number[] {
   const clean = round2(Math.max(MIN_STAKE, Number.isFinite(base) ? base : MIN_STAKE));
-  if (!weighted) return [clean, clean, clean];
-  return [clean, MIN_STAKE, MIN_STAKE];
+  const legs = Math.max(1, Math.min(PREDICTION_COUNTS[PREDICTION_COUNTS.length - 1], Math.floor(count)));
+  if (!weighted) return new Array<number>(legs).fill(clean);
+  const boosted = round2(Math.max(MIN_STAKE, clean + clean * 1.5));
+  const stakes = new Array<number>(legs).fill(clean);
+  stakes[0] = boosted;
+  return stakes;
+}
+
+/** stepStakePerDigit = +(base * multiplier^level).toFixed(2), floored at 0.35. */
+export function martingaleStake(base: number, multiplier: number, level: number): number {
+  const cleanBase = Number.isFinite(base) ? base : MIN_STAKE;
+  const factor = Math.min(MAX_MULTIPLIER, Math.max(MIN_MULTIPLIER, Number.isFinite(multiplier) ? multiplier : 1.6));
+  const step = Math.max(0, Math.floor(level));
+  return round2(Math.max(MIN_STAKE, cleanBase * Math.pow(factor, step)));
+}
+
+/** A win resets to 0; a loss at the cap also resets instead of going past it. */
+export function nextMartingaleLevel(level: number, maxLevels: number, lost: boolean): number {
+  if (!lost) return 0;
+  const cap = Math.max(1, Math.min(MAX_MARTINGALE_LEVELS, Math.floor(maxLevels)));
+  const current = Math.max(0, Math.min(cap, Math.floor(level)));
+  return current >= cap ? 0 : current + 1;
+}
+
+/** Probability of missing level + 1 rounds in a row. */
+export function streakMissProbability(combined: number, level: number): number {
+  const miss = Math.min(1, Math.max(0, 1 - (Number.isFinite(combined) ? combined : 0)));
+  return Math.pow(miss, Math.max(0, Math.floor(level)) + 1);
 }
 
 export function bundleTotal(stakes: readonly number[]): number {

@@ -3,19 +3,32 @@ import type { ReactElement, ReactNode } from "react";
 import type { Account, DerivSession, Quote, SymbolInfo, Tick } from "@/deriv";
 import TransitionMeshCircle from "@/components/TransitionMeshCircle";
 import {
+  AUTO_MULTIPLIER,
+  DEFAULT_DOMINANCE_PERCENT,
+  MAX_MARTINGALE_LEVELS,
+  MAX_MULTIPLIER,
+  MIN_MULTIPLIER,
   MIN_STAKE,
+  PREDICTION_COUNTS,
+  ROI_BADGE,
+  UNIFORM_BASELINE,
   bundleTotal,
   combinedProbability,
   decimalsFromPip,
   dominanceShare,
   evaluateMesh,
+  martingaleStake,
+  nextMartingaleLevel,
   round2,
   splitStakes,
+  streakMissProbability,
   topDigits,
 } from "@/utils/transitionMeshMath";
-import type { ConsensusKind, RankedDigit } from "@/utils/transitionMeshMath";
+import type { ConsensusKind, PredictionCount, RankedDigit } from "@/utils/transitionMeshMath";
 
 type Gate = "any" | "strong" | "triple";
+type ConfirmMode = "auto" | "single";
+type MultiplierChoice = "auto" | "1.6" | "1.9" | "2.4" | "custom";
 
 interface Props {
   sessionRef: { readonly current: DerivSession | null };
@@ -49,6 +62,7 @@ interface RoundRow {
   total: number;
   profit: number;
   probability: number;
+  level: number;
 }
 
 const FAMILY_TITLE: Record<string, string> = {
@@ -60,8 +74,14 @@ const FAMILY_TITLE: Record<string, string> = {
 const DEFAULT_LOOKBACKS: [number, number, number] = [100, 150, 200];
 const ESTIMATED_PAYOUT = 8.93;
 const SETTLEMENT_TIMEOUT_MS = 30000;
-/** 3 proposals + 3 buys + 3 watches + 3 forgets per round, inside 360/min. */
-const MIN_ROUND_GAP_SEC = 3;
+/**
+ * One round costs roughly 4K API calls (proposal, buy, watch, forget per leg).
+ * Pacing against 300/min leaves headroom under Deriv's 360/min budget:
+ * K=3 -> 3 s, K=4 -> 4 s, K=5 -> 4 s.
+ */
+function minRoundGapSec(legs: number): number {
+  return Math.max(3, Math.ceil((4 * Math.max(1, legs) * 60) / 300));
+}
 
 const inputClass =
   "w-full rounded border border-line bg-ink px-2 py-1.5 font-mono text-xs text-slate-100 outline-none focus:border-accent disabled:opacity-50";
@@ -115,13 +135,22 @@ export default function MeshHedgePage(props: Props): ReactElement {
   const [weighted, setWeighted] = useState(false);
   const [gate, setGate] = useState<Gate>("any");
   const [cooldownSec, setCooldownSec] = useState(3);
+  const [predictionCount, setPredictionCount] = useState<PredictionCount>(3);
+  const [dominanceThreshold, setDominanceThreshold] = useState<number>(DEFAULT_DOMINANCE_PERCENT[3]);
+  const [thresholdLocked, setThresholdLocked] = useState(false);
+  const [martingaleOn, setMartingaleOn] = useState(false);
+  const [multiplierChoice, setMultiplierChoice] = useState<MultiplierChoice>("auto");
+  const [customMultiplier, setCustomMultiplier] = useState(2);
+  const [maxLevels, setMaxLevels] = useState(3);
+  const [martingaleLevel, setMartingaleLevel] = useState(0);
+  const [executing, setExecuting] = useState(false);
   const [pnl, setPnl] = useState(0);
   const [rounds, setRounds] = useState<RoundRow[]>([]);
   const [wins, setWins] = useState(0);
   const [losses, setLosses] = useState(0);
   const [payoutRatio, setPayoutRatio] = useState(ESTIMATED_PAYOUT);
   const [openLegs, setOpenLegs] = useState<Leg[] | null>(null);
-  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [confirmMode, setConfirmMode] = useState<ConfirmMode | null>(null);
   const [confirmText, setConfirmText] = useState("");
   const [realOk, setRealOk] = useState(false);
 
@@ -136,10 +165,16 @@ export default function MeshHedgePage(props: Props): ReactElement {
   const decimalsRef = useRef(2);
   const stepFilterRef = useRef(false);
   const lookbacksRef = useRef<[number, number, number]>(DEFAULT_LOOKBACKS);
-  const baseRef = useRef(MIN_STAKE);
   const weightedRef = useRef(false);
   const gateRef = useRef<Gate>("any");
   const cooldownRef = useRef(3);
+  const countRef = useRef<PredictionCount>(3);
+  const dominanceRef = useRef(DEFAULT_DOMINANCE_PERCENT[3]);
+  const martingaleOnRef = useRef(false);
+  const martingaleLevelRef = useRef(0);
+  const maxLevelsRef = useRef(3);
+  const stakePerDigitRef = useRef(MIN_STAKE);
+  const roundLevelRef = useRef(0);
   const pnlRef = useRef(0);
   const roundNoRef = useRef(0);
   const legsRef = useRef<Map<number, Leg>>(new Map());
@@ -153,11 +188,18 @@ export default function MeshHedgePage(props: Props): ReactElement {
 
   useEffect(() => { symbolRef.current = symbol; }, [symbol]);
   useEffect(() => { currencyRef.current = currency; }, [currency]);
-  useEffect(() => { baseRef.current = baseStake; }, [baseStake]);
   useEffect(() => { weightedRef.current = weighted; }, [weighted]);
   useEffect(() => { gateRef.current = gate; }, [gate]);
   useEffect(() => { cooldownRef.current = cooldownSec; }, [cooldownSec]);
+  useEffect(() => { countRef.current = predictionCount; }, [predictionCount]);
+  useEffect(() => { dominanceRef.current = dominanceThreshold; }, [dominanceThreshold]);
+  useEffect(() => { martingaleOnRef.current = martingaleOn; }, [martingaleOn]);
+  useEffect(() => { martingaleLevelRef.current = martingaleLevel; }, [martingaleLevel]);
+  useEffect(() => { maxLevelsRef.current = maxLevels; }, [maxLevels]);
   useEffect(() => { setRealOk(false); }, [accountId]);
+  useEffect(() => {
+    if (!thresholdLocked) setDominanceThreshold(DEFAULT_DOMINANCE_PERCENT[predictionCount]);
+  }, [predictionCount, thresholdLocked]);
 
   useEffect(() => {
     if (symbol || symbols.length === 0) return;
@@ -179,6 +221,23 @@ export default function MeshHedgePage(props: Props): ReactElement {
       lookbacksRef.current = next;
       return next;
     });
+  }, []);
+
+  const changePredictionCount = useCallback((next: PredictionCount) => {
+    if (armedRef.current || execRef.current) return;
+    setPredictionCount(next);
+    setMartingaleLevel(0);
+    martingaleLevelRef.current = 0;
+  }, []);
+
+  const toggleMartingale = useCallback(() => {
+    const next = !martingaleOnRef.current;
+    martingaleOnRef.current = next;
+    setMartingaleOn(next);
+    if (!next) {
+      setMartingaleLevel(0);
+      martingaleLevelRef.current = 0;
+    }
   }, []);
 
   const forgetSubscriptions = useCallback(() => {
@@ -209,6 +268,11 @@ export default function MeshHedgePage(props: Props): ReactElement {
     const nextPnl = round2(pnlRef.current + profit);
     pnlRef.current = nextPnl;
     roundNoRef.current += 1;
+    const levelUsed = roundLevelRef.current;
+    const nextLevel = martingaleOnRef.current
+      ? nextMartingaleLevel(levelUsed, maxLevelsRef.current, profit < 0)
+      : 0;
+    martingaleLevelRef.current = nextLevel;
     const row: RoundRow = {
       id: roundNoRef.current,
       time: Date.now(),
@@ -218,9 +282,11 @@ export default function MeshHedgePage(props: Props): ReactElement {
       total,
       profit,
       probability: roundProbabilityRef.current,
+      level: levelUsed,
     };
     if (aliveRef.current) {
       setPnl(nextPnl);
+      setMartingaleLevel(nextLevel);
       setWins((value) => value + (profit > 0 ? 1 : 0));
       setLosses((value) => value + (profit < 0 ? 1 : 0));
       setRounds((rows) => [row, ...rows].slice(0, 100));
@@ -231,7 +297,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
     legsRef.current.clear();
     roundLegsRef.current = [];
     settleProfitRef.current = 0;
-    const wait = Math.max(cooldownRef.current, MIN_ROUND_GAP_SEC);
+    const wait = Math.max(cooldownRef.current, minRoundGapSec(legs.length || countRef.current));
     if (wait > 0 && armedRef.current && aliveRef.current) {
       coolingRef.current = true;
       for (let left = wait; left > 0 && armedRef.current && aliveRef.current; left -= 1) {
@@ -270,18 +336,21 @@ export default function MeshHedgePage(props: Props): ReactElement {
     return () => bindContractListener(null);
   }, [bindContractListener, handleContract]);
 
-  const executeBundle = useCallback(async (top: RankedDigit[], stakes: [number, number, number]) => {
+  const executeBundle = useCallback(async (top: RankedDigit[], mode: ConfirmMode) => {
     const session = sessionRef.current;
-    if (!session) {
+    if (!session || top.length === 0) {
       execRef.current = false;
       return;
     }
+    execRef.current = true;
+    const stakes = splitStakes(stakePerDigitRef.current, weightedRef.current, top.length);
     const market = symbolRef.current;
     const cash = currencyRef.current;
     settleProfitRef.current = 0;
     roundLegsRef.current = [];
+    roundLevelRef.current = martingaleOnRef.current ? martingaleLevelRef.current : 0;
     roundProbabilityRef.current = combinedProbability(top);
-    setPhase("Pricing 3 legs...");
+    setPhase("Pricing " + top.length + " leg" + (top.length === 1 ? "" : "s") + "...");
     let priced: Quote[] = [];
     try {
       priced = await session.quoteBundle(
@@ -308,12 +377,12 @@ export default function MeshHedgePage(props: Props): ReactElement {
       execRef.current = false;
       return;
     }
-    if (!armedRef.current) {
+    if (mode === "auto" && !armedRef.current) {
       execRef.current = false;
       setPhase("Paused");
       return;
     }
-    setPhase("Locking 3 contracts...");
+    setPhase("Locking " + priced.length + " contract" + (priced.length === 1 ? "" : "s") + "...");
     const results = await Promise.allSettled(priced.map((quote) => session.buy(quote.id, quote.ask)));
     const legs: Leg[] = [];
     const failures: string[] = [];
@@ -331,7 +400,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
     if (legs.length === 0) {
       execRef.current = false;
       setPhase("Paused: no contracts bought");
-      onNotice(failures[0] ?? "Deriv rejected all three legs.", "bad");
+      onNotice(failures[0] ?? "Deriv rejected all " + top.length + " legs.", "bad");
       return;
     }
     for (const leg of legs) {
@@ -341,7 +410,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
     roundLegsRef.current = legs;
     bundleTotalRef.current = bundleTotal(legs.map((leg) => leg.stake));
     setOpenLegs(legs.slice());
-    setPhase("Open: " + legs.length + " / 3 legs");
+    setPhase("Open: " + legs.length + " / " + top.length + " legs");
     if (failures.length > 0) onNotice(failures.length + " leg(s) rejected: " + failures[0], "bad");
     try {
       for (const leg of legs) {
@@ -379,18 +448,69 @@ export default function MeshHedgePage(props: Props): ReactElement {
     const evaluation = evaluateMesh(quotesRef.current, decimalsRef.current, lookbacksRef.current, stepFilterRef.current);
     const required = Math.max(...lookbacksRef.current);
     if (evaluation.digits.length < required) return;
-    const top = topDigits(evaluation.ranked, 3);
-    if (top.length < 3) {
-      setPhase("Waiting for 3 reachable digits");
+    const top = topDigits(evaluation.ranked, countRef.current);
+    if (top.length === 0) {
+      setPhase("Waiting for a reachable digit");
+      return;
+    }
+    const combinedPct = combinedProbability(top) * 100;
+    if (combinedPct + 1e-9 < dominanceRef.current) {
+      setPhase("Scanning: dominance " + combinedPct.toFixed(0) + "% < " + dominanceRef.current.toFixed(0) + "%");
       return;
     }
     if (!gateAllows(evaluation.consensus.kind, gateRef.current)) {
       setPhase("Scanning: alignment gate not met");
       return;
     }
-    execRef.current = true;
-    await executeBundle(top, splitStakes(baseRef.current, weightedRef.current));
+    await executeBundle(top, "auto");
   }, [executeBundle, sessionRef]);
+
+  /** One manual hedge, outside the auto loop. Gates are bypassed by design. */
+  const fireOnce = useCallback(async () => {
+    if (armedRef.current || execRef.current || coolingRef.current || finalizingRef.current) return;
+    if (activeBundleIdsRef.current.size > 0) return;
+    const session = sessionRef.current;
+    const market = symbolRef.current;
+    if (!session || !market) {
+      onNotice("Connect and select a market before firing a hedge.", "bad");
+      return;
+    }
+    const evaluation = evaluateMesh(quotesRef.current, decimalsRef.current, lookbacksRef.current, stepFilterRef.current);
+    const required = Math.max(...lookbacksRef.current);
+    if (evaluation.digits.length < required) {
+      onNotice("Collecting ticks: " + evaluation.digits.length + " of " + required + " needed before a manual hedge.", "bad");
+      return;
+    }
+    const top = topDigits(evaluation.ranked, countRef.current);
+    if (top.length === 0) {
+      onNotice("No reachable digit to hedge from the current centre digit yet.", "bad");
+      return;
+    }
+    setExecuting(true);
+    try {
+      await executeBundle(top, "single");
+    } finally {
+      if (aliveRef.current) setExecuting(false);
+    }
+  }, [executeBundle, onNotice, sessionRef]);
+
+  const fireSingle = useCallback(() => {
+    if (!connected) {
+      onConnect();
+      return;
+    }
+    if (!symbolRef.current) {
+      onNotice("Select a market first.", "bad");
+      return;
+    }
+    if (armedRef.current || execRef.current) return;
+    if (accountKind === "real" && !realOk) {
+      setConfirmText("");
+      setConfirmMode("single");
+      return;
+    }
+    void fireOnce();
+  }, [accountKind, connected, fireOnce, onConnect, onNotice, realOk]);
 
   useEffect(() => {
     const session = sessionRef.current;
@@ -454,11 +574,39 @@ export default function MeshHedgePage(props: Props): ReactElement {
     }
     if (accountKind === "real" && !realOk) {
       setConfirmText("");
-      setConfirmOpen(true);
+      setConfirmMode("auto");
       return;
     }
     armEngine();
   }, [accountKind, armEngine, connected, onConnect, realOk]);
+
+  const exportCsv = useCallback(() => {
+    const header = ["time", "symbol", "digits", "stakes", "bundle", "probability", "profit", "martingale_level"];
+    const escape = (value: string | number): string => {
+      const text = String(value);
+      return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+    };
+    const lines = [header.join(",")];
+    for (const row of rounds) {
+      lines.push([
+        new Date(row.time).toISOString(),
+        row.symbol,
+        row.digits.join(" "),
+        row.stakes.map((stake) => stake.toFixed(2)).join(" "),
+        row.total.toFixed(2),
+        (row.probability * 100).toFixed(2),
+        row.profit.toFixed(2),
+        "L" + row.level,
+      ].map(escape).join(","));
+    }
+    const blob = new Blob([lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = "mesh-hedge-rounds.csv";
+    link.click();
+    URL.revokeObjectURL(url);
+  }, [rounds]);
 
   const resetSession = useCallback(() => {
     if (activeBundleIdsRef.current.size > 0) return;
@@ -471,6 +619,8 @@ export default function MeshHedgePage(props: Props): ReactElement {
     setWins(0);
     setLosses(0);
     setOpenLegs(null);
+    setMartingaleLevel(0);
+    martingaleLevelRef.current = 0;
   }, [stopEngine]);
 
   useEffect(() => {
@@ -503,17 +653,57 @@ export default function MeshHedgePage(props: Props): ReactElement {
     () => evaluateMesh(quotes, decimals, lookbacks, stepFilter),
     [quotes, decimals, lookbacks, stepFilter],
   );
-  const top = topDigits(evaluation.ranked, 3);
+  const top = topDigits(evaluation.ranked, predictionCount);
+  const reachableCount = stepFilter ? evaluation.ranked.filter((entry) => entry.transition > 0).length : 10;
   const combined = combinedProbability(top);
-  const dominance = dominanceShare(combined);
-  const stakes = splitStakes(baseStake, weighted);
+  const combinedPct = combined * 100;
+  const baseline = UNIFORM_BASELINE[predictionCount];
+  const lift = dominanceShare(combined, baseline);
+  const autoMultiplier = AUTO_MULTIPLIER[predictionCount];
+  const activeMultiplier =
+    multiplierChoice === "auto"
+      ? autoMultiplier
+      : multiplierChoice === "custom"
+        ? clamp(customMultiplier, MIN_MULTIPLIER, MAX_MULTIPLIER)
+        : Number(multiplierChoice);
+  const cleanBase = round2(Math.max(MIN_STAKE, baseStake));
+  const currentLevel = martingaleOn ? martingaleLevel : 0;
+  const stakePerDigit = martingaleOn
+    ? martingaleStake(cleanBase, activeMultiplier, currentLevel)
+    : cleanBase;
+  const stakeCount = Math.max(1, top.length || predictionCount);
+  const stakes = splitStakes(stakePerDigit, weighted, stakeCount);
   const bundle = bundleTotal(stakes);
   const minStake = Math.min(...stakes);
   const netIfHit = round2(payoutRatio * minStake - bundle);
+  const nextLevel = martingaleOn ? nextMartingaleLevel(currentLevel, maxLevels, true) : 0;
+  const nextStakePerDigit = martingaleOn ? martingaleStake(cleanBase, activeMultiplier, nextLevel) : cleanBase;
+  const nextStakes = splitStakes(nextStakePerDigit, weighted, stakeCount);
+  const nextBundle = bundleTotal(nextStakes);
   const required = Math.max(...lookbacks);
   const ready = evaluation.digits.length >= required;
   const center = evaluation.center;
   const consensus = evaluation.consensus;
+  const minGap = minRoundGapSec(predictionCount);
+  const dominancePass = combinedPct + 1e-9 >= dominanceThreshold;
+
+  let cumulativeRisk = 0;
+  const progression = Array.from({ length: maxLevels + 1 }, (_, level) => {
+    const perDigit = martingaleStake(cleanBase, activeMultiplier, level);
+    const rowStakes = splitStakes(perDigit, weighted, stakeCount);
+    const cost = bundleTotal(rowStakes);
+    cumulativeRisk = round2(cumulativeRisk + cost);
+    return {
+      level,
+      perDigit,
+      cost,
+      cumulative: cumulativeRisk,
+      netIfHit: round2(payoutRatio * Math.min(...rowStakes) - cost),
+      missStreak: streakMissProbability(combined, level) * 100,
+    };
+  });
+
+  useEffect(() => { stakePerDigitRef.current = stakePerDigit; }, [stakePerDigit]);
 
   const consensusTone =
     consensus.kind === "triple"
@@ -592,7 +782,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
           </div>
           {stepFilter ? (
             <p className="mt-2 rounded border border-amber-400/40 bg-amber-400/10 px-2 py-1 text-[10px] text-amber-300">
-              Step indices rarely quote DIGITMATCH. If Deriv rejects all three legs the round stops flat and no position is opened.
+              Step indices rarely quote DIGITMATCH. If Deriv rejects all {top.length || predictionCount} legs the round stops flat and no position is opened.
             </p>
           ) : null}
         </article>
@@ -625,11 +815,19 @@ export default function MeshHedgePage(props: Props): ReactElement {
         <article className="rounded border border-line bg-panel p-4">
           <div className="flex flex-wrap items-end justify-between gap-2">
             <div>
-              <h2 className="text-sm font-semibold tracking-tight">Top 3 hedged DIGITMATCH digits</h2>
+              <h2 className="text-sm font-semibold tracking-tight">Top {predictionCount} hedged DIGITMATCH digits</h2>
               <p className="text-[11px] text-muted">Score = 0.60 x normalised window frequency + 0.40 x P(next | centre digit){stepFilter ? ", zeroed when the step index cannot reach the digit" : ""}.</p>
             </div>
-            <span className="rounded-full border border-line px-3 py-1 text-[11px] text-muted">{gate === "any" ? "No alignment gate" : gate === "strong" ? "Needs strong or triple" : "Needs triple alignment"}</span>
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              <span className="rounded-full border border-line px-3 py-1 text-muted">{predictionCount} predictions</span>
+              <span className="rounded-full border border-line px-3 py-1 text-muted">{gate === "any" ? "No alignment gate" : gate === "strong" ? "Needs strong or triple" : "Needs triple alignment"}</span>
+            </div>
           </div>
+          {stepFilter && top.length < predictionCount ? (
+            <p className="mt-2 rounded border border-sky-400/40 bg-sky-400/10 px-2 py-1 text-[10px] text-sky-300">
+              Step Reachability Guard: Buying {top.length} of {predictionCount} digits ({reachableCount} reachable from centre digit {center >= 0 ? center : "-"}).
+            </p>
+          ) : null}
 
           <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_290px]">
             <div className="overflow-x-auto">
@@ -639,7 +837,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
                 </thead>
                 <tbody className="font-mono">
                   {top.length === 0 ? (
-                    <tr><td colSpan={5} className="py-2 text-muted">Warming up: no ranked digit yet.</td></tr>
+                    <tr><td colSpan={5} className="py-2 text-muted">{stepFilter ? "No digit is reachable from the current centre digit yet." : "Warming up: no ranked digit yet."}</td></tr>
                   ) : (
                     top.map((entry, index) => (
                       <tr key={entry.digit} className="border-t border-line/60">
@@ -661,9 +859,14 @@ export default function MeshHedgePage(props: Props): ReactElement {
                 <dd className="font-mono text-base text-slate-100">{(combined * 100).toFixed(1)}%</dd>
               </div>
               <div>
-                <dt className="text-[10px] uppercase tracking-widest text-muted">Dominance share</dt>
-                <dd className="font-mono text-base text-slate-100">{(dominance * 100).toFixed(0)}%</dd>
-                <p className="text-[9px] text-muted">vs the 30% uniform baseline</p>
+                <dt className="text-[10px] uppercase tracking-widest text-muted">Dominance gate</dt>
+                <dd className={"font-mono text-base " + (dominancePass ? "text-accent" : "text-amber-300")}>{combinedPct.toFixed(1)}% / {dominanceThreshold.toFixed(0)}%</dd>
+                <p className="text-[9px] text-muted">{dominancePass ? "pass" : "below threshold"} - uniform {baseline * 100}%</p>
+              </div>
+              <div>
+                <dt className="text-[10px] uppercase tracking-widest text-muted">Lift vs random</dt>
+                <dd className="font-mono text-base text-slate-100">{lift.toFixed(2)}x</dd>
+                <p className="text-[9px] text-muted">combined / {baseline * 100}% baseline</p>
               </div>
               <div>
                 <dt className="text-[10px] uppercase tracking-widest text-muted">Net if any leg hits</dt>
@@ -673,20 +876,62 @@ export default function MeshHedgePage(props: Props): ReactElement {
               <div>
                 <dt className="text-[10px] uppercase tracking-widest text-muted">Bundle cost</dt>
                 <dd className="font-mono text-base text-slate-100">{bundle.toFixed(2)} {currency}</dd>
-                <p className="text-[9px] text-muted">3 x {MIN_STAKE.toFixed(2)} minimum per contract</p>
+                <p className="text-[9px] text-muted">{stakeCount} legs, {MIN_STAKE.toFixed(2)} minimum per contract</p>
               </div>
             </dl>
           </div>
         </article>
 
         <article className="rounded border border-line bg-panel p-4">
+          <div className="mb-4">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <h2 className="text-sm font-semibold tracking-tight">Predictions per round</h2>
+              <span className="text-[10px] text-muted">Top-K DIGITMATCH bundle - switch while paused</span>
+            </div>
+            <div className="mt-2 grid gap-2 sm:grid-cols-3">
+              {PREDICTION_COUNTS.map((count) => {
+                const selected = count === predictionCount;
+                return (
+                  <button
+                    key={count}
+                    type="button"
+                    aria-label={count + " digits: " + ROI_BADGE[count]}
+                    disabled={armed || executing || !!openLegs}
+                    onClick={() => changePredictionCount(count)}
+                    className={"rounded border px-3 py-2 text-left transition disabled:opacity-50 " + (selected ? "border-accent bg-accent/10" : "border-line bg-ink hover:border-muted")}
+                  >
+                    <span className="flex flex-wrap items-center justify-between gap-2">
+                      <span className={"text-sm font-semibold " + (selected ? "text-accent" : "text-slate-100")}>{count} Digits</span>
+                      <span className="rounded-full border border-line px-2 py-0.5 text-[9px] text-muted">{ROI_BADGE[count]}</span>
+                    </span>
+                    <span className="mt-1 block text-[9px] text-muted">Default gate {DEFAULT_DOMINANCE_PERCENT[count]}% - auto {AUTO_MULTIPLIER[count].toFixed(1)}x recovery</span>
+                  </button>
+                );
+              })}
+            </div>
+            {predictionCount === 5 ? (
+              <p className="mt-2 rounded border border-amber-400/40 bg-amber-400/10 px-2 py-1.5 text-[10px] text-amber-300">
+                5 predictions cover 50% of digits (~78% net ROI per hit) and require a 2.4× Martingale step to recover losses.
+              </p>
+            ) : null}
+          </div>
+
           <div className="flex flex-wrap items-center gap-3">
             <button
               type="button"
-              onClick={armed ? () => stopEngine("Paused") : start}
-              className={"rounded px-5 py-2 text-sm font-semibold " + (armed ? "border border-danger/50 bg-danger/10 text-danger" : "bg-accent text-ink")}
+              onClick={fireSingle}
+              disabled={armed || executing || !!openLegs}
+              className="rounded border border-accent/50 bg-accent/10 px-4 py-2 text-sm font-semibold text-accent disabled:opacity-40"
             >
-              {armed ? "Pause" : "Start"}
+              Fire Single Hedge Now
+            </button>
+            <button
+              type="button"
+              onClick={armed ? () => stopEngine("Paused") : start}
+              disabled={executing || !!openLegs}
+              className={"rounded px-5 py-2 text-sm font-semibold disabled:opacity-40 " + (armed ? "border border-danger/50 bg-danger/10 text-danger" : "bg-accent text-ink")}
+            >
+              {armed ? "Pause" : "Start Auto-Hedge"}
             </button>
             <span role="status" className={"rounded-full border px-3 py-1 text-[11px] " + (armed ? "border-accent/40 text-accent" : "border-line text-muted")}>{phase}</span>
             {cooldownLeft > 0 ? <span className="text-[11px] text-muted">cooling {cooldownLeft}s</span> : null}
@@ -704,41 +949,179 @@ export default function MeshHedgePage(props: Props): ReactElement {
             </div>
           ) : null}
 
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
             <Field label={"Base stake per digit (" + currency + ")"}>
               <input
                 type="number"
                 min={MIN_STAKE}
                 step={0.01}
                 value={baseStake}
-                disabled={armed}
+                disabled={armed || executing || !!openLegs}
                 onChange={(event) => setBaseStake(Math.max(MIN_STAKE, Number(event.target.value) || MIN_STAKE))}
                 className={inputClass}
               />
             </Field>
             <Field label="Stake split">
               <div className="flex gap-1">
-                <button type="button" disabled={armed} onClick={() => setWeighted(false)} className={"flex-1 rounded px-2 py-1.5 text-[11px] disabled:opacity-50 " + (!weighted ? "bg-accent text-ink" : "border border-line text-muted")}>Flat</button>
-                <button type="button" disabled={armed} onClick={() => setWeighted(true)} className={"flex-1 rounded px-2 py-1.5 text-[11px] disabled:opacity-50 " + (weighted ? "bg-accent text-ink" : "border border-line text-muted")}>Weighted</button>
+                <button type="button" disabled={armed || executing || !!openLegs} onClick={() => setWeighted(false)} className={"flex-1 rounded px-2 py-1.5 text-[11px] disabled:opacity-50 " + (!weighted ? "bg-accent text-ink" : "border border-line text-muted")}>Equal</button>
+                <button type="button" disabled={armed || executing || !!openLegs} onClick={() => setWeighted(true)} className={"flex-1 rounded px-2 py-1.5 text-[11px] disabled:opacity-50 " + (weighted ? "bg-accent text-ink" : "border border-line text-muted")}>Weighted</button>
+              </div>
+            </Field>
+            <Field label="Min combined dominance (%)">
+              <div className="flex gap-1">
+                <input
+                  type="number"
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={dominanceThreshold}
+                  disabled={armed || executing || !!openLegs}
+                  onChange={(event) => {
+                    setDominanceThreshold(clamp(Number(event.target.value), 0, 100));
+                    setThresholdLocked(true);
+                  }}
+                  className={inputClass}
+                />
+                <button
+                  type="button"
+                  disabled={armed || executing || !!openLegs}
+                  onClick={() => setThresholdLocked((value) => !value)}
+                  title="When unlocked, the threshold follows the prediction count"
+                  className={"rounded border px-2 text-[10px] disabled:opacity-50 " + (thresholdLocked ? "border-amber-400/50 text-amber-300" : "border-line text-muted")}
+                >
+                  {thresholdLocked ? "Locked" : "Auto"}
+                </button>
               </div>
             </Field>
             <Field label="Alignment gate">
-              <select value={gate} onChange={(event) => setGate(event.target.value as Gate)} disabled={armed} className={inputClass}>
+              <select value={gate} onChange={(event) => setGate(event.target.value as Gate)} disabled={armed || executing || !!openLegs} className={inputClass}>
                 <option value="any">Any signal</option>
                 <option value="strong">Strong or triple</option>
                 <option value="triple">Triple only</option>
               </select>
             </Field>
-            <Field label="Cooldown (seconds, effective min 3)">
-              <input type="number" min={0} max={60} value={cooldownSec} onChange={(event) => setCooldownSec(clamp(Number(event.target.value), 0, 60))} className={inputClass} />
+            <Field label={"Cooldown (s, effective min " + minGap + ")"}>
+              <input type="number" min={0} max={60} value={cooldownSec} disabled={armed || executing || !!openLegs} onChange={(event) => setCooldownSec(clamp(Number(event.target.value), 0, 60))} className={inputClass} />
             </Field>
+          </div>
+
+          <div className="mt-4 rounded border border-line bg-ink/40 p-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div>
+                <h3 className="text-xs font-semibold uppercase tracking-widest text-slate-200">Martingale Settings</h3>
+                <p className="mt-1 text-[10px] text-muted">OFF = flat base stake every round. ON = step up only after a full miss and reset to Level 0 on any win or at max levels.</p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={martingaleOn}
+                onClick={toggleMartingale}
+                disabled={armed || executing || !!openLegs}
+                className={"flex items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold disabled:opacity-50 " + (martingaleOn ? "border-accent/60 bg-accent/15 text-accent" : "border-line bg-panel text-muted")}
+              >
+                <span className={"h-2 w-2 rounded-full " + (martingaleOn ? "bg-accent" : "bg-slate-500")} />
+                Martingale {martingaleOn ? "ON" : "OFF"}
+              </button>
+            </div>
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <Field label="Multiplier after a loss">
+                <select
+                  value={multiplierChoice}
+                  disabled={armed || executing || !!openLegs}
+                  onChange={(event) => setMultiplierChoice(event.target.value as MultiplierChoice)}
+                  className={inputClass}
+                >
+                  <option value="auto">Auto-matched ({autoMultiplier.toFixed(2)}x for {predictionCount})</option>
+                  <option value="1.6">1.6x after a loss</option>
+                  <option value="1.9">1.9x after a loss</option>
+                  <option value="2.4">2.4x after a loss</option>
+                  <option value="custom">Custom multiplier</option>
+                </select>
+              </Field>
+              {multiplierChoice === "custom" ? (
+                <Field label={"Custom multiplier (" + MIN_MULTIPLIER.toFixed(2) + " - " + MAX_MULTIPLIER.toFixed(2) + ")"}>
+                  <input
+                    type="number"
+                    min={MIN_MULTIPLIER}
+                    max={MAX_MULTIPLIER}
+                    step={0.05}
+                    value={customMultiplier}
+                    disabled={armed || executing || !!openLegs}
+                    onChange={(event) => setCustomMultiplier(clamp(Number(event.target.value) || MIN_MULTIPLIER, MIN_MULTIPLIER, MAX_MULTIPLIER))}
+                    className={inputClass}
+                  />
+                </Field>
+              ) : (
+                <div className="text-[10px] text-muted">
+                  <p className="uppercase tracking-widest">Auto-matched</p>
+                  <p className="mt-1 text-[11px] text-slate-300">{predictionCount} predictions use {autoMultiplier.toFixed(2)}x after a full miss.</p>
+                </div>
+              )}
+              <Field label={"Martingale max levels (1 - " + MAX_MARTINGALE_LEVELS + ")"}>
+                <input
+                  type="number"
+                  min={1}
+                  max={MAX_MARTINGALE_LEVELS}
+                  step={1}
+                  value={maxLevels}
+                  disabled={armed || executing || !!openLegs}
+                  onChange={(event) => {
+                    const next = clamp(Math.round(Number(event.target.value) || 1), 1, MAX_MARTINGALE_LEVELS);
+                    setMaxLevels(next);
+                    if (martingaleLevel > next) setMartingaleLevel(0);
+                  }}
+                  className={inputClass}
+                />
+              </Field>
+            </div>
+
+            <p className="mt-2 font-mono text-[10px] text-muted">
+              stepStakePerDigit = +({cleanBase.toFixed(2)} x {activeMultiplier.toFixed(2)}^{currentLevel}).toFixed(2) = {stakePerDigit.toFixed(2)} {currency} at Level {currentLevel}
+            </p>
+
+            <div className="mt-3 overflow-x-auto">
+              <table className="w-full text-left text-[10px]">
+                <thead className="text-[9px] uppercase tracking-widest text-muted">
+                  <tr>
+                    <th className="py-1 pr-2">Level</th>
+                    <th className="py-1 pr-2">Stake / Digit</th>
+                    <th className="py-1 pr-2">Total Bundle Cost</th>
+                    <th className="py-1 pr-2">Cumulative Risk</th>
+                    <th className="py-1 pr-2">Net Profit if Hit</th>
+                    <th className="py-1" title="Probability that all selected digits miss this many rounds in a row">Streak Odds</th>
+                  </tr>
+                </thead>
+                <tbody className="font-mono">
+                  {progression.map((row) => {
+                    const active = row.level === (martingaleOn ? martingaleLevel : 0);
+                    return (
+                      <tr key={row.level} className={"border-t border-line/60 " + (active ? "bg-accent/10 text-accent" : "text-slate-300")}>
+                        <td className="py-1 pr-2">L{row.level}{row.level === maxLevels ? " (cap)" : ""}</td>
+                        <td className="py-1 pr-2">{row.perDigit.toFixed(2)}</td>
+                        <td className="py-1 pr-2">{row.cost.toFixed(2)}</td>
+                        <td className="py-1 pr-2">{row.cumulative.toFixed(2)}</td>
+                        <td className={"py-1 pr-2 " + (row.netIfHit >= 0 ? "text-accent" : "text-danger")}>{row.netIfHit >= 0 ? "+" : ""}{row.netIfHit.toFixed(2)}</td>
+                        <td className="py-1">{ready && combined > 0 ? row.missStreak.toFixed(1) + "%" : "-"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <p className="mt-1 text-[9px] leading-relaxed text-muted">
+              Values in {currency}. Stake / Digit is the base step stake; Weighted boosts leg #1 by another 1.5x. Cumulative risk adds every bundle from Level 0 to that level. Streak odds use the current combined hit rate of the {top.length || predictionCount} selected digits and show the chance of missing that many rounds in a row. {martingaleOn ? "The highlighted row is the live level." : "Master OFF: only Level 0 is traded, the rest is preview."}
+            </p>
           </div>
 
           <div className="mt-3 flex flex-wrap items-center gap-2 text-[11px] text-muted">
             <span className="rounded border border-line bg-ink px-2 py-1 font-mono">
-              Legs {stakes[0].toFixed(2)} / {stakes[1].toFixed(2)} / {stakes[2].toFixed(2)} = {bundle.toFixed(2)} {currency}
+              Legs {stakes.map((stake) => stake.toFixed(2)).join(" / ")} = {bundle.toFixed(2)} {currency}
             </span>
-            <span>{weighted ? "Weighted: leg #1 carries the extra stake, legs #2-3 stay at the minimum." : "Flat: every leg carries the same stake."} A 3 s floor keeps the proposal budget under Deriv's 360/min.</span>
+            <span>
+              {weighted ? "Weighted: leg #1 gets base + 1.5x, legs #2-" + predictionCount + " stay at base." : "Equal: every leg gets the base stake."}{" "}
+              {martingaleOn ? "Martingale ON at Level " + currentLevel + ", next bundle " + nextBundle.toFixed(2) + ", cap " + maxLevels + "." : "Martingale OFF, flat stake."} A {minGap}s floor keeps the K={predictionCount} proposal budget under Deriv's 360/min.
+            </span>
             <button type="button" onClick={resetSession} disabled={!!openLegs} className="ml-auto rounded border border-line px-3 py-1 text-[11px] text-muted hover:text-slate-100 disabled:opacity-40">Reset session</button>
           </div>
 
@@ -761,15 +1144,25 @@ export default function MeshHedgePage(props: Props): ReactElement {
             </div>
           </dl>
 
+          <p className="mt-2 font-mono text-[11px] text-slate-200">
+            Martingale Level: {martingaleOn ? martingaleLevel : 0} / {maxLevels}
+            <span className="mx-2 text-muted">·</span>
+            Next Bundle Stake: {nextBundle.toFixed(2)} {currency}
+            <span className="ml-2 text-[10px] text-muted">{martingaleOn ? "(if the next round misses)" : "(flat)"}</span>
+          </p>
+
           <p className="mt-3 text-[10px] leading-relaxed text-muted">
-            All three DIGITMATCH legs are priced together and bought in one Promise.all burst, then the lock stays closed until every bought contract reports is_sold and the cooldown finishes. A 30 second settlement timeout stops the bot rather than guessing an outcome. A one-tick match pays about 8.93x, implying an 11.2% break-even per digit against a fair 10%: hedging spreads the loss, it does not create an edge.
+            All {top.length || predictionCount} DIGITMATCH legs are priced together and bought in one Promise.all burst, then the lock stays closed until every bought contract reports is_sold and the cooldown finishes. A 30 second settlement timeout stops the bot rather than guessing an outcome. A one-tick match pays about 8.93x, implying an 11.2% break-even per digit against a fair 10%: hedging spreads the loss, it does not create an edge. The ROI badges are gross per-hit returns at that payout; misses and the house margin still apply.
           </p>
         </article>
 
         <article className="rounded border border-line bg-panel p-4">
-          <div className="flex items-center justify-between">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="text-sm font-semibold tracking-tight">Recent rounds</h2>
-            <span className="text-[10px] text-muted">latest 100</span>
+            <div className="flex items-center gap-2">
+              <span className="text-[10px] text-muted">latest 100</span>
+              <button type="button" onClick={exportCsv} disabled={rounds.length === 0} className="rounded border border-line px-2 py-1 text-[10px] text-muted hover:text-slate-100 disabled:opacity-40">Export CSV</button>
+            </div>
           </div>
           {rounds.length === 0 ? (
             <p className="mt-2 text-xs text-muted">No rounds settled in this session yet.</p>
@@ -777,7 +1170,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
             <div className="mt-2 overflow-x-auto">
               <table className="w-full text-left text-[11px]">
                 <thead className="text-[10px] uppercase tracking-widest text-muted">
-                  <tr><th className="py-1 pr-2">Time</th><th className="py-1 pr-2">Symbol</th><th className="py-1 pr-2">Digits</th><th className="py-1 pr-2">Stakes</th><th className="py-1 pr-2">Cost</th><th className="py-1 pr-2">P(next)</th><th className="py-1">Net</th></tr>
+                  <tr><th className="py-1 pr-2">Time</th><th className="py-1 pr-2">Symbol</th><th className="py-1 pr-2">Digits</th><th className="py-1 pr-2">Stakes</th><th className="py-1 pr-2">Cost</th><th className="py-1 pr-2">P(next)</th><th className="py-1 pr-2">Mg</th><th className="py-1">Net</th></tr>
                 </thead>
                 <tbody className="font-mono">
                   {rounds.map((row) => (
@@ -788,6 +1181,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
                       <td className="py-1 pr-2">{row.stakes.map((stake) => stake.toFixed(2)).join(" / ")}</td>
                       <td className="py-1 pr-2">{row.total.toFixed(2)}</td>
                       <td className="py-1 pr-2">{(row.probability * 100).toFixed(1)}%</td>
+                      <td className="py-1 pr-2">L{row.level}</td>
                       <td className={"py-1 " + (row.profit > 0 ? "text-accent" : row.profit < 0 ? "text-danger" : "")}>{row.profit.toFixed(2)}</td>
                     </tr>
                   ))}
@@ -798,31 +1192,43 @@ export default function MeshHedgePage(props: Props): ReactElement {
         </article>
       </div>
 
-      {confirmOpen ? (
-        <Modal title="Start the 3-leg hedge on a real account?" onClose={() => setConfirmOpen(false)}>
+      {confirmMode ? (
+        <Modal
+          title={confirmMode === "single" ? "Fire a " + predictionCount + "-leg hedge on a real account?" : "Start the " + predictionCount + "-leg auto-hedge on a real account?"}
+          onClose={() => setConfirmMode(null)}
+        >
           <div className="space-y-3 text-xs">
             <p className="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-danger">
-              This session is live money ({accountId}). Every round buys three 1-tick DIGITMATCH contracts and can lose the whole bundle when none of the three digits prints.
+              This session is live money ({accountId}). {confirmMode === "single" ? "This click buys" : "Every round buys"} {stakes.length} 1-tick DIGITMATCH contracts and can lose the whole bundle when none of the {predictionCount} selected digits prints.
             </p>
             <dl className="grid grid-cols-2 gap-2 font-mono">
-              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Legs</dt><dd>{stakes[0].toFixed(2)} / {stakes[1].toFixed(2)} / {stakes[2].toFixed(2)} {currency}</dd></div>
+              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Legs</dt><dd>{stakes.map((stake) => stake.toFixed(2)).join(" / ")} {currency}</dd></div>
               <div><dt className="text-[10px] uppercase tracking-widest text-muted">Bundle at risk</dt><dd>{bundle.toFixed(2)} {currency}</dd></div>
               <div><dt className="text-[10px] uppercase tracking-widest text-muted">Max loss per round</dt><dd>{bundle.toFixed(2)} {currency}</dd></div>
+              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Predictions</dt><dd>{predictionCount} ({top.length} reachable)</dd></div>
               <div><dt className="text-[10px] uppercase tracking-widest text-muted">Alignment gate</dt><dd>{gate}</dd></div>
+              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Dominance gate</dt><dd>{dominanceThreshold}%</dd></div>
+              <div><dt className="text-[10px] uppercase tracking-widest text-muted">Martingale</dt><dd>{martingaleOn ? "ON · level " + martingaleLevel + " / " + maxLevels + " · " + activeMultiplier.toFixed(2) + "x" : "OFF (flat)"}</dd></div>
             </dl>
             <label className="block text-[11px] text-muted">
               Type REAL to confirm
               <input value={confirmText} onChange={(event) => setConfirmText(event.target.value)} className={inputClass + " mt-1"} placeholder="REAL" spellCheck={false} />
             </label>
             <div className="flex justify-end gap-2">
-              <button type="button" onClick={() => setConfirmOpen(false)} className="rounded border border-line px-3 py-1.5 text-xs text-muted">Cancel</button>
+              <button type="button" onClick={() => setConfirmMode(null)} className="rounded border border-line px-3 py-1.5 text-xs text-muted">Cancel</button>
               <button
                 type="button"
                 disabled={confirmText.trim().toUpperCase() !== "REAL"}
-                onClick={() => { setRealOk(true); setConfirmOpen(false); armEngine(); }}
+                onClick={() => {
+                  const mode = confirmMode;
+                  setRealOk(true);
+                  setConfirmMode(null);
+                  if (mode === "auto") armEngine();
+                  else if (mode === "single") void fireOnce();
+                }}
                 className="rounded bg-danger px-3 py-1.5 text-xs font-semibold text-ink disabled:opacity-40"
               >
-                Start on real money
+                {confirmMode === "single" ? "Fire on real money" : "Start on real money"}
               </button>
             </div>
           </div>

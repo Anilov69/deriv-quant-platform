@@ -128,7 +128,7 @@ consensus**, anything else is **divergent**. The optional alignment gate can
 require strong or triple before a round, but it defaults to "any" so the hedge is
 not silently disabled.
 
-### Hybrid score and the 3-digit bundle
+### Hybrid score and the K-digit bundle
 
 ```
 S(j) = 0.60 * f_bar_windows(j) + 0.40 * P(d(t+1) = j | d(t))
@@ -138,28 +138,52 @@ S(j) = 0.60 * f_bar_windows(j) + 0.40 * P(d(t+1) = j | d(t))
 `P(next | current)` is the empirical transition row of the largest window. On
 step symbols, a digit whose observed transition probability is zero is forced to
 score zero, because the step generator cannot reach it from the current digit.
-The page shows the top three with their individual probabilities, the combined
-`P1 + P2 + P3`, the combined dominance share against the 30% uniform baseline,
-and the projected net if any single leg hits (payout multiple read from the last
-executed quotes, 8.93x until then).
+The page shows the top K with their individual probabilities, the combined
+`P1 + ... + PK`, the minimum dominance gate, the lift against the K/10 random
+baseline, and the projected net if any single leg hits (payout multiple read from
+the last executed quotes, 8.93x until then). The selector offers **3 / 4 / 5**
+predictions:
+
+| Predictions | Default dominance gate | Random baseline | Auto multiplier | Badge |
+| --- | --- | --- | --- | --- |
+| 3 | 36% | 30% | 1.6x | Sweet Spot · ~197% ROI |
+| 4 | 47% | 40% | 1.9x | Balanced · ~123% ROI |
+| 5 | 58% | 50% | 2.4x | High Coverage · ~78% ROI |
+
+Changing K updates the gate and multiplier unless the gate is locked, and the
+progression table updates with it. On step symbols, digits with zero transition
+probability are never bought: the bundle is clamped to the reachable digits and
+the page shows a Step Reachability Guard pill instead of filling the K with
+impossible contracts.
 
 Stakes follow Deriv's **0.35 minimum per contract**:
 
-| Split | Leg #1 | Leg #2 | Leg #3 | Bundle |
-| --- | --- | --- | --- | --- |
-| Flat | base | base | base | 3 x base (1.05 at the minimum) |
-| Weighted | base | 0.35 | 0.35 | base + 0.70 (0.60 / 0.35 / 0.35 = 1.30) |
+| Split | Leg #1 | Legs #2..K | Bundle at base 0.35 |
+| --- | --- | --- | --- |
+| Equal | base | base | K x base (1.05 for K=3, 1.75 for K=5) |
+| Weighted | base + 1.5 x base | base | 0.88 / 0.35 / 0.35 = 1.58 for K=3 |
 
-All three legs go to `toFixed(2)`. The normal single-quote path paces proposals
-320 ms apart for the ladder; the hedge instead calls `quoteBundle`, which sends
-the three `proposal` frames as one burst inside the same rate budget, and then
-buys them with one `Promise.all`. A buy needs the proposal id and its price, so
-the request is `{ buy: <id>, price: <ask> }`, not the legacy parameter block.
+With base 0.60 and K=3, weighted is 1.50 / 0.60 / 0.60 = 2.70. Every leg is
+rounded with `toFixed(2)` and clamped to 0.35. The normal single-quote path
+paces proposals 320 ms apart for the ladder; the hedge calls `quoteBundle`,
+which sends the K `proposal` frames as one burst inside the same rate budget,
+and then buys them with one `Promise.all`. A buy needs the proposal id and its
+price, so the request is `{ buy: <id>, price: <ask> }`, not the legacy block.
 
-A round costs 3 proposals, 3 buys, 3 watches and 3 forgets, so the page keeps a
-3 s floor between rounds even when the cooldown is set lower. That holds the
-connection at roughly 240 calls/min against Deriv's 360/min budget. A pricing
-failure stops the hedge instead of retrying into the limit.
+**Martingale** is explicit in the controls card: a master ON/OFF switch, an
+auto-matched multiplier (1.6x / 1.9x / 2.4x for K=3/4/5) or a fixed/custom one
+(1.10-5.00), and 1-6 max levels. The stake at level L is
+`+(base * multiplier^L).toFixed(2)`, never below 0.35, then split across the K
+legs. A full-miss round steps up; any winning round resets to Level 0; a loss at
+the cap also resets to Level 0. The table shows stake/digit, bundle, cumulative
+risk, net profit if hit and the probability of missing that many rounds in a row.
+Every history row and the CSV export carry the level used.
+
+A round costs roughly 4K calls (proposal, buy, watch, forget), so the page floors
+the gap at 3 s for K=3 and 4 s for K=4-5. That keeps the connection near 240-300
+calls/min against Deriv's 360/min budget. A pricing failure stops the hedge
+instead of retrying into the limit; **Fire Single Hedge Now** fires one K-leg
+manual bundle, still under the lock and settlement accounting.
 
 ### Locking and settlement
 
@@ -168,28 +192,37 @@ added before its `proposal_open_contract` subscription starts, removed only when
 that contract reports `is_sold === 1`, and the execution lock stays closed until
 the set is empty **and** the post-round cooldown has finished. A 30 s timeout
 stops the bot and forgets the subscriptions instead of guessing a result; a
-partial buy (one or two legs rejected) is recorded as what actually filled, never
-as the intended three.
+partial buy (one or more legs rejected) is recorded as what actually filled, never
+as the intended K.
 
 Step indices do not quote `DIGITMATCH` on the live API today, so selecting
-`stpRNG` will usually end with all three legs rejected and no position. The page
-keeps the family because the spec asks for it, filters unreachable digits, and
-says so instead of pretending a contract exists.
+`stpRNG` will usually end with all K legs rejected and no position. The page
+keeps the family because the spec asks for it, filters unreachable digits, clamps
+the bundle to what the step generator can reach, and says so instead of pretending
+a contract exists.
 
-Hedging three digits does not create an edge. At a fair 10% per digit the flat
-bundle hits 30% of the time; an 8.93x payout on the 1.05 bundle returns about
-0.94, so the expected loss is roughly 0.11 per round. A hit does pay (3.13 back
-for 1.05 staked), which is exactly what makes the losing rounds look rare. The
-mesh changes which digits are chosen; it cannot change the house price.
+Hedging more digits does not create an edge. At a fair 10% per digit the flat
+K=3 bundle hits 30% of the time; an 8.93x payout on the 1.05 bundle returns about
+0.94, so the expected loss is roughly 0.11 per round. K=5 hits 50% of the time but
+costs 1.75, and at 8.93x the expected payout is about 1.56, so the expected loss
+is roughly 0.19 per round. Every K is negative EV at this price. The ROI badges (~197% / ~123% / ~78%) are gross per-hit
+returns at 8.93x, not expected returns: they ignore the losing rounds and the
+house margin. The mesh changes which digits are chosen; it cannot change the price.
+The recovery table is a budget plan, not a guarantee that a hit arrives before the
+account or the cap runs out.
 
 ### Verification
 
-`npm run typecheck`, `npm test` (79 tests across six files, 20 of them for the
-mesh maths) and `npm run build` pass locally. The built `dist/` was loaded cold
-at `/#/mesh-hedge` and through the nav links; the three circles, the collecting
-banner and the empty state render with no console errors, and a seeded 300-tick
-buffer produces the expected colours, outgoing arrows and triple-alignment
-banner. The execution path is code-reviewed and unit-tested at the maths and
+`npm run typecheck`, `npm test` (83 tests across six files, 24 of them for the
+mesh maths, prediction scaling and martingale stakes) and `npm run build` pass
+locally. The built `dist/` was loaded cold at `/#/mesh-hedge`: the 3/4/5 picker
+updates the Top-K heading, dominance gate, auto multiplier, bundle cost and
+progression table live; Weighted yields 0.88 / 0.35 / 0.35 / 0.35 / 0.35 at
+K=5; locking the gate holds 40% across a K switch and Auto restores 58%; the
+martingale switch highlights the live row and projects the next bundle; no
+console errors. The three circles, the collecting banner and a seeded 300-tick
+buffer still render the expected colours and triple-alignment banner. The
+funded execution path remains code-reviewed and unit-tested at the maths and
 transport layers, but it has not been run against a funded account.
 
 ## Auto-trade and martingale

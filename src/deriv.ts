@@ -393,7 +393,7 @@ export class DerivSession {
 
   /**
    * A simultaneous proposal burst for a hedged bundle. The single-quote path
-   * paces proposals 320 ms apart for the ladder, but a 3-leg DIGITMATCH hedge
+   * paces proposals 320 ms apart for the ladder, but a K-leg DIGITMATCH hedge
    * must price on one tick, so these proposals are sent back to back (still
    * inside Deriv's 360/min budget) and the caller buys them in one Promise.all.
    */
@@ -409,7 +409,7 @@ export class DerivSession {
         } catch (error) {
           if (isRateLimit(error)) {
             this.proposalPausedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
-            throw new DerivError("RateLimit", "Deriv rate-limited the 3-leg proposal burst; pausing.", 0);
+            throw new DerivError("RateLimit", "Deriv rate-limited the K-leg proposal burst; pausing.", 0);
           }
           throw error;
         }

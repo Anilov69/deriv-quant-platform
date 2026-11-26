@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
-  MIN_STAKE,
+  AUTO_MULTIPLIER,
+  DEFAULT_DOMINANCE_PERCENT,
+  UNIFORM_BASELINE,
   buildMesh,
   bundleTotal,
   combinedProbability,
@@ -11,9 +13,12 @@ import {
   evaluateMesh,
   formatQuote,
   lastDigit,
+  martingaleStake,
+  nextMartingaleLevel,
   nodeTone,
   scoreDigits,
   splitStakes,
+  streakMissProbability,
   topDigits,
   transitionProbabilities,
 } from "@/utils/transitionMeshMath";
@@ -207,16 +212,52 @@ describe("stake planning", () => {
     expect(bundleTotal(splitStakes(0.35, false))).toBe(1.05);
   });
 
-  it("scales only leg one in weighted mode", () => {
-    const stakes = splitStakes(0.6, true);
-    expect(stakes).toEqual([0.6, MIN_STAKE, MIN_STAKE]);
-    expect(bundleTotal(stakes)).toBe(1.3);
+  it("adds a 1.5x bonus to leg one in weighted mode", () => {
+    const three = splitStakes(0.6, true);
+    expect(three).toEqual([1.5, 0.6, 0.6]);
+    expect(bundleTotal(three)).toBe(2.7);
+    expect(splitStakes(0.35, true, 5)).toEqual([0.88, 0.35, 0.35, 0.35, 0.35]);
+    expect(splitStakes(0.35, false, 4)).toEqual([0.35, 0.35, 0.35, 0.35]);
   });
 
   it("clamps tiny or invalid stakes up to the minimum", () => {
-    expect(splitStakes(0.2, true)).toEqual([0.35, 0.35, 0.35]);
+    expect(splitStakes(0.2, false)).toEqual([0.35, 0.35, 0.35]);
+    expect(splitStakes(0.2, true)).toEqual([0.88, 0.35, 0.35]);
     expect(splitStakes(Number.NaN, false)).toEqual([0.35, 0.35, 0.35]);
     expect(splitStakes(0.444, false)[0]).toBe(0.44);
+    expect(splitStakes(0.35, false, 99)).toHaveLength(5);
+  });
+});
+
+describe("prediction and martingale scaling", () => {
+  it("scales the default dominance floor and auto multiplier with K", () => {
+    expect(DEFAULT_DOMINANCE_PERCENT).toEqual({ 3: 36, 4: 47, 5: 58 });
+    expect(UNIFORM_BASELINE).toEqual({ 3: 0.3, 4: 0.4, 5: 0.5 });
+    expect(AUTO_MULTIPLIER).toEqual({ 3: 1.6, 4: 1.9, 5: 2.4 });
+  });
+
+  it("applies the multiplier per level and never drops below the minimum", () => {
+    expect(martingaleStake(0.35, 1.6, 0)).toBe(0.35);
+    expect(martingaleStake(0.35, 1.6, 1)).toBe(0.56);
+    expect(martingaleStake(0.35, 1.6, 2)).toBe(0.9);
+    expect(martingaleStake(0.35, 2.4, 2)).toBe(2.02);
+    expect(martingaleStake(0.1, 1.6, 0)).toBe(0.35);
+    expect(martingaleStake(0.35, 99, 1)).toBe(1.75);
+    expect(martingaleStake(0.35, 0.1, 1)).toBe(0.39);
+  });
+
+  it("resets on a win, steps on a loss, and resets at the cap", () => {
+    expect(nextMartingaleLevel(0, 3, false)).toBe(0);
+    expect(nextMartingaleLevel(0, 3, true)).toBe(1);
+    expect(nextMartingaleLevel(3, 3, true)).toBe(0);
+    expect(nextMartingaleLevel(2, 3, true)).toBe(3);
+    expect(nextMartingaleLevel(40, 3, true)).toBe(0);
+  });
+
+  it("computes the odds of missing an entire streak", () => {
+    expect(streakMissProbability(0.5, 0)).toBeCloseTo(0.5, 10);
+    expect(streakMissProbability(0.5, 2)).toBeCloseTo(0.125, 10);
+    expect(streakMissProbability(1, 3)).toBe(0);
   });
 });
 
