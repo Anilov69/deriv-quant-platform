@@ -928,7 +928,7 @@ export default function MeshHedgePage(props: Props): ReactElement {
             <button
               type="button"
               onClick={armed ? () => stopEngine("Paused") : start}
-              disabled={executing || !!openLegs}
+              disabled={!armed && (executing || !!openLegs)}
               className={"rounded px-5 py-2 text-sm font-semibold disabled:opacity-40 " + (armed ? "border border-danger/50 bg-danger/10 text-danger" : "bg-accent text-ink")}
             >
               {armed ? "Pause" : "Start Auto-Hedge"}
