@@ -141,6 +141,8 @@ export default function App(): ReactElement {
   const [appId, setAppId] = useState("");
   const [remember, setRemember] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [autoArmed, setAutoArmed] = useState(false);
+  const quotingRef = useRef(false);
 
   useEffect(() => {
     const session = new DerivSession();
@@ -310,6 +312,8 @@ export default function App(): ReactElement {
     const session = sessionRef.current;
     const list = candidatesRef.current;
     if (!session || !session.live || !symbol || list.length === 0) return;
+    if (quotingRef.current) return;
+    quotingRef.current = true;
     setQuoting(true);
     const quotes = new Map<string, { ask: number; payout: number }>();
     const ids = new Map<string, string>();
@@ -329,12 +333,12 @@ export default function App(): ReactElement {
         } catch {
           /* Deriv does not offer this contract on this symbol */
         }
-        await new Promise((resolve) => window.setTimeout(resolve, 200));
       }
       quoteIdsRef.current = ids;
       setRows(rank(list, quotes));
       setQuotedAt(Date.now());
     } finally {
+      quotingRef.current = false;
       setQuoting(false);
     }
   }, [symbol, stake, currency]);
@@ -344,10 +348,16 @@ export default function App(): ReactElement {
 
   useEffect(() => {
     if (status !== "live" || !symbol) return;
+    // While auto-trade is armed it owns the proposal budget; the table would
+    // compete with the engine and re-trigger Deriv's burst limit.
+    if (autoArmed) {
+      setRows([]);
+      return;
+    }
     void refreshRef.current();
-    const timer = window.setInterval(() => void refreshRef.current(), 9000);
+    const timer = window.setInterval(() => void refreshRef.current(), 12000);
     return () => window.clearInterval(timer);
-  }, [status, symbol, stake, currency]);
+  }, [status, symbol, stake, currency, autoArmed]);
 
   const buy = useCallback(async (row: RankedQuote): Promise<void> => {
     const session = sessionRef.current;
@@ -729,6 +739,7 @@ export default function App(): ReactElement {
         connected={live}
         accountKind={accountKind}
         accountId={accountId}
+        onArmedChange={setAutoArmed}
         balance={balance}
         currency={currency}
         symbol={symbol}

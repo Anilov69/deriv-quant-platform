@@ -116,6 +116,21 @@ async function rest(path: string, token: string, appId: string, method: "GET" | 
   }
 }
 
+/**
+ * Deriv's documented WebSocket budget is 360 proposal-class calls a minute,
+ * shared with proposal_open_contract and buy. That is an average of 6/s, but a
+ * burst of proposals is rejected long before the average is reached, which is
+ * exactly what an unpaced ladder refresh does. Every proposal therefore goes
+ * through one serialised queue with a floor interval, and a RateLimit answer
+ * parks the queue instead of retrying.
+ */
+export const PROPOSAL_SPACING_MS = 320;
+const RATE_LIMIT_PAUSE_MS = 5000;
+
+export function isRateLimit(error: unknown): boolean {
+  return error instanceof Error && /rate[\s-]?limit/i.test(error.message);
+}
+
 export class DerivSession {
   status: Status = "idle";
   accountId = "";
@@ -134,6 +149,9 @@ export class DerivSession {
   private token = "";
   private appId = "";
   private closing = false;
+  private proposalChain: Promise<unknown> = Promise.resolve();
+  private lastProposalAt = 0;
+  private proposalPausedUntil = 0;
 
   get live(): boolean {
     return this.status === "live";
@@ -330,12 +348,32 @@ export class DerivSession {
       underlying_symbol: input.symbol,
     };
     if (input.barrier !== undefined) payload.barrier = input.barrier;
-    const message = await this.send(payload);
+    const message = await this.sendProposal(payload);
     const proposal = message?.proposal;
     const ask = num(proposal?.ask_price);
     const payout = num(proposal?.payout);
     if (!proposal?.id || ask <= 0 || payout <= 0) throw new DerivError("NoQuote", "Deriv returned no usable quote.");
     return { id: String(proposal.id), ask, payout };
+  }
+
+  private sendProposal(payload: Record<string, unknown>): Promise<any> {
+    const run = this.proposalChain.then(async () => {
+      const now = Date.now();
+      const wait = Math.max(this.proposalPausedUntil - now, this.lastProposalAt + PROPOSAL_SPACING_MS - now, 0);
+      if (wait > 0) await new Promise<void>((resolve) => setTimeout(resolve, wait));
+      this.lastProposalAt = Date.now();
+      try {
+        return await this.send(payload);
+      } catch (error) {
+        if (isRateLimit(error)) {
+          this.proposalPausedUntil = Date.now() + RATE_LIMIT_PAUSE_MS;
+          throw new DerivError("RateLimit", "Deriv rate-limited proposals; pausing for a few seconds.", 0);
+        }
+        throw error;
+      }
+    });
+    this.proposalChain = run.catch(() => undefined);
+    return run;
   }
 
   async buy(id: string, price: number): Promise<number> {

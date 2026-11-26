@@ -10,6 +10,7 @@
  * own.
  */
 
+import { isRateLimit } from "@/deriv";
 import type { Family } from "@/deriv";
 import { buildCandidates } from "@/ladder";
 import type { Candidate } from "@/ladder";
@@ -243,7 +244,10 @@ export class AutoTrader {
   private settleTimer: ReturnType<typeof setTimeout> | null = null;
   private tickWaiters: Array<{ remaining: number; resolve: () => void }> = [];
   private dayKey = "";
-  private scanDelay = 900;
+  private scanDelay = 1200;
+  private rateLimited = 0;
+  private payoutCache = new Map<string, number>();
+  private lastLog: { message: string; at: number } | null = null;
 
   constructor(private readonly ports: Ports, private readonly clock: Clock = realClock) {}
 
@@ -380,6 +384,14 @@ export class AutoTrader {
           return;
         }
         if (!this.running) return;
+        if (isRateLimit(error)) {
+          this.rateLimited += 1;
+          const wait = Math.min(60_000, 4000 * Math.pow(2, Math.min(3, this.rateLimited - 1)));
+          this.setState("SCANNING", "Deriv rate limit - backing off " + Math.round(wait / 1000) + "s");
+          this.log("Deriv rate-limited proposals; backing off " + Math.round(wait / 1000) + "s.", "bad");
+          await this.clock.sleep(wait);
+          continue;
+        }
         this.log((error as Error).message, "bad");
         await this.clock.sleep(1500);
       }
@@ -392,37 +404,50 @@ export class AutoTrader {
     const allowed = this.allowedContracts();
     if (allowed.length === 0) return null;
 
-    const candidates = buildCandidates({
+    const ranked = buildCandidates({
       family: snapshot.family,
       probabilities: snapshot.probabilities,
       currentDigit: snapshot.currentDigit,
       momentumZ: snapshot.momentumZ,
     })
       .filter((candidate) => allowed.includes(candidate.contract))
-      .sort((a, b) => b.probability - a.probability)
-      .slice(0, 3);
+      .map((candidate) => ({ candidate, estimate: this.estimateEdge(candidate) }))
+      .sort((a, b) => b.estimate - a.estimate);
 
-    if (candidates.length === 0) return null;
+    if (ranked.length === 0) return null;
     this.setState("SCANNING", "scanning " + snapshot.symbol);
 
-    for (const candidate of candidates) {
-      if (!this.running) return null;
-      this.setState("FETCHING", "quote for " + candidate.contract);
-      try {
-        const prepared = await this.priceCandidate(candidate);
-        if (!prepared) continue;
-        const edge = prepared.candidate.probability * prepared.quote.payout - prepared.quote.ask;
-        const passes = this.config.metric === "ev"
-          ? (edge / prepared.quote.ask) * 100 >= this.config.minEvPct
-          : prepared.candidate.probability * 100 >= this.config.minWinPct;
-        if (passes) return prepared;
-      } catch (error) {
-        if (error instanceof HaltSignal) throw error;
-        this.log(candidate.contract + ": " + (error as Error).message, "bad");
-      }
-      await this.clock.sleep(250);
-    }
-    return null;
+    // One proposal per cycle. Quoting three candidates in a row is what tripped
+    // Deriv's burst limit; a cached payout ratio is enough to pick the best one.
+    const { candidate } = ranked[0];
+    this.setState("FETCHING", "quote for " + candidate.contract);
+    const prepared = await this.priceCandidate(candidate);
+    if (!prepared) return null;
+    const edge = prepared.candidate.probability * prepared.quote.payout - prepared.quote.ask;
+    const passes = this.config.metric === "ev"
+      ? (edge / prepared.quote.ask) * 100 >= this.config.minEvPct
+      : prepared.candidate.probability * 100 >= this.config.minWinPct;
+    return passes ? prepared : null;
+  }
+
+  private cacheKey(candidate: Candidate): string {
+    return candidate.contract + "|" + (candidate.barrier ?? "");
+  }
+
+  private estimateEdge(candidate: Candidate): number {
+    const cached = this.payoutCache.get(this.cacheKey(candidate));
+    if (cached !== undefined) return candidate.probability * cached - 1;
+    const fallback: Record<string, number> = {
+      DIGITMATCH: 8.93,
+      DIGITDIFF: 1.09,
+      DIGITOVER: 2.4,
+      DIGITUNDER: 2.4,
+      DIGITODD: 1.95,
+      DIGITEVEN: 1.95,
+      CALL: 1.95,
+      PUT: 1.95,
+    };
+    return candidate.probability * (fallback[candidate.contract] ?? 1.95) - 1;
   }
 
   private async priceCandidate(candidate: Candidate): Promise<{ candidate: Candidate; quote: Quote; stake: number } | null> {
@@ -430,6 +455,8 @@ export class AutoTrader {
     if (!payoutStep) {
       const stake = planStake({ martingale: this.martingale, book: this.book, payoutRatio: this.lastPayoutRatio }).stake;
       const quote = await this.ports.quote({ contract: candidate.contract, barrier: candidate.barrier, duration: candidate.duration, stake });
+      this.rateLimited = 0;
+      this.payoutCache.set(this.cacheKey(candidate), payoutRatioOf(quote));
       return { candidate, quote, stake };
     }
     // Probe at the base stake first: the recovery stake depends on the payout this
@@ -444,6 +471,8 @@ export class AutoTrader {
     const quote = Math.abs(stake - this.martingale.baseStake) < 0.01
       ? probe
       : await this.ports.quote({ contract: candidate.contract, barrier: candidate.barrier, duration: candidate.duration, stake });
+    this.rateLimited = 0;
+    this.payoutCache.set(this.cacheKey(candidate), payoutRatioOf(quote));
     return { candidate, quote, stake };
   }
 
@@ -536,6 +565,9 @@ export class AutoTrader {
   }
 
   private log(message: string, tone: "info" | "good" | "bad"): void {
+    const now = this.clock.now();
+    if (this.lastLog && this.lastLog.message === message && now - this.lastLog.at < 15000) return;
+    this.lastLog = { message, at: now };
     this.onLog?.(message, tone);
   }
 }

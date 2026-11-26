@@ -109,6 +109,12 @@ Over/Under or an 8.9x one-tick match. A win, or reaching the step cap, resets th
 ladder to `S0`. The preview table prices the streak at the gate's win rate, and the
 daily loss limit / profit target stop the engine and reset the ladder.
 
+Deriv budgets proposal-class calls per connection and rejects *bursts* well before
+the per-minute average. So proposals are serialised through one queue with a 320 ms
+floor, auto-trade quotes exactly one candidate per cycle, and the manual ladder
+refresh stops while auto-trade is armed. A `RateLimit` answer parks the queue and
+makes the engine back off (4 s, 8 s, 16 s, 32 s) instead of retrying into the wall.
+
 The maths is pure: `planStake`, `settleBook` and `previewSteps` in
 `src/autotrade.ts`, covered by `tests/autotrade.test.ts` — including the lock test
 that asserts a second buy cannot happen before settlement.

@@ -254,6 +254,33 @@ describe("auto-trade engine", () => {
     engine.stop("test done");
   });
 
+  it("backs off instead of hammering when Deriv rate-limits proposals", async () => {
+    const sleeps: number[] = [];
+    const { ports } = makePorts();
+    const limited: Ports = {
+      ...ports,
+      quote: async () => {
+        throw new Error("You have reached the rate limit for proposal.");
+      },
+    };
+    const engine = new AutoTrader(limited, {
+      sleep: (ms) => {
+        sleeps.push(ms);
+        return new Promise((resolve) => setTimeout(resolve, 0));
+      },
+      now: () => Date.now(),
+    });
+    const halts: string[] = [];
+    engine.onHalt = (reason) => halts.push(reason);
+    engine.configure(config({ minEvPct: 0 }), martingale({ enabled: false }));
+    engine.start();
+    await waitFor(() => sleeps.some((ms) => ms >= 4000), "rate-limit backoff");
+    expect(sleeps).toContain(4000);
+    expect(halts).toHaveLength(0);
+    expect(engine.state).not.toBe("HALTED");
+    engine.stop("test done");
+  });
+
   it("does not trade a step index when only digit contracts are enabled", async () => {
     const step = snapshot({ symbol: "stpRNG2", family: "step", currentDigit: 0, momentumZ: 0 });
     const { ports, state } = makePorts(1.95, step);

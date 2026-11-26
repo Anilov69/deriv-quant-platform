@@ -186,6 +186,20 @@ describe("requests", () => {
     expect(typeof buyFrame?.price).toBe("number");
   });
 
+  it("paces proposals so a batch cannot trip Deriv's burst limit", async () => {
+    const { session, socket } = await connect();
+    const started = Date.now();
+    await Promise.all([
+      session.quote({ symbol: "R_100", contract: "DIGITMATCH", barrier: "3", duration: 1, stake: 1, currency: "USD" }),
+      session.quote({ symbol: "R_100", contract: "DIGITDIFF", barrier: "3", duration: 1, stake: 1, currency: "USD" }),
+      session.quote({ symbol: "R_100", contract: "DIGITODD", duration: 1, stake: 1, currency: "USD" }),
+    ]);
+    const proposals = socket.sent.filter((item) => item.proposal !== undefined);
+    expect(proposals).toHaveLength(3);
+    // Two forced gaps between three proposals, even though all were requested at once.
+    expect(Date.now() - started).toBeGreaterThanOrEqual(600);
+  });
+
   it("streams ticks and seeds history for the same symbol", async () => {
     const { session } = await connect();
     const ticks: number[] = [];

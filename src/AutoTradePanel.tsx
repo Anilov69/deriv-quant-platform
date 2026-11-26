@@ -15,6 +15,7 @@ interface Props {
   connected: boolean;
   accountKind: "demo" | "real" | "unknown";
   accountId: string;
+  onArmedChange: (armed: boolean) => void;
   balance: number | null;
   currency: string;
   symbol: string;
@@ -83,7 +84,7 @@ function NumberBox(props: {
 }
 
 export default function AutoTradePanel(props: Props): ReactElement {
-  const { engine, connected, accountKind, accountId, balance, currency, symbol } = props;
+  const { engine, connected, accountKind, accountId, onArmedChange, balance, currency, symbol } = props;
 
   const [autoOn, setAutoOn] = useState(false);
   const [state, setState] = useState<AutoState>("OFF");
@@ -176,6 +177,10 @@ export default function AutoTradePanel(props: Props): ReactElement {
     }
   }, [connected, autoOn, engine]);
 
+  useEffect(() => {
+    onArmedChange(autoOn);
+  }, [autoOn, onArmedChange]);
+
   const accountRef = useRef(accountId);
   useEffect(() => {
     if (accountRef.current === accountId) return;
@@ -230,6 +235,8 @@ export default function AutoTradePanel(props: Props): ReactElement {
 
   const net = book.netProfit;
   const enabledCount = TYPES.filter((type) => filters[type.key]).length;
+  const growth = preview.length > 1 && preview[0].stake > 0 ? preview[1].stake / preview[0].stake : 1;
+  const steepLadder = martOn && growth >= 3;
 
   return (
     <section id="auto-trade" className="border-t border-line bg-panel px-4 py-5">
@@ -430,24 +437,29 @@ export default function AutoTradePanel(props: Props): ReactElement {
               <tr className="border-b border-line text-left text-[10px] tracking-wide text-muted">
                 <th className="py-1 pr-3 font-medium">STEP</th>
                 <th className="py-1 pr-3 font-medium">STAKE</th>
-                <th className="py-1 pr-3 font-medium">CUMULATIVE CAPITAL AT RISK</th>
+                <th className="py-1 pr-3 font-medium">CUM. RISK</th>
                 <th className="py-1 font-medium">STREAK PROBABILITY</th>
               </tr>
             </thead>
             <tbody>
               {preview.map((row) => (
                 <tr key={row.step} className={"border-b border-line/60 " + (row.step === book.step && martOn ? "text-accent" : "text-slate-200")}>
-                  <td className="py-1 pr-3 font-mono">{row.step}</td>
-                  <td className="py-1 pr-3 font-mono">{row.stake.toFixed(2)} {currency}</td>
-                  <td className="py-1 pr-3 font-mono">{row.cumulativeRisk.toFixed(2)} {currency}</td>
-                  <td className="py-1 font-mono">{(row.streakProbability * 100).toFixed(1)}%</td>
+                  <td className="whitespace-nowrap py-1 pr-3 font-mono">{row.step}</td>
+                  <td className="whitespace-nowrap py-1 pr-3 font-mono">{row.stake.toFixed(2)} {currency}</td>
+                  <td className="whitespace-nowrap py-1 pr-3 font-mono">{row.cumulativeRisk.toFixed(2)} {currency}</td>
+                  <td className="whitespace-nowrap py-1 font-mono">{(row.streakProbability * 100).toFixed(1)}%</td>
                 </tr>
               ))}
             </tbody>
           </table>
         </div>
+        {steepLadder ? (
+          <p role="alert" className="mt-2 rounded border border-danger/50 bg-danger/10 px-2 py-1 text-[10px] text-danger">
+            At this payout each step multiplies the stake by about {growth.toFixed(1)}x, so step {preview[preview.length - 1].step} risks {preview[preview.length - 1].cumulativeRisk.toFixed(2)} {currency} to recover one base stake. That is how a &quot;safe&quot; 90% contract produces a 12x ladder.
+          </p>
+        ) : null}
         <p className="mt-1 text-[10px] text-muted">
-          Streak probability assumes the gate's win rate ({Math.round(winAssumption * 100)}%) and a payout ratio of {payoutAssumption.toFixed(2)}x. The real payout is re-read from Deriv before every buy; the ladder is the price of surviving a losing run, not a guarantee of recovery.
+          Streak probability assumes the gate's win rate ({Math.round(winAssumption * 100)}%) and a payout ratio of {payoutAssumption.toFixed(2)}x (updated from the last live proposal, editable above). The real payout is re-read from Deriv before every buy; the ladder is the price of surviving a losing run, not a guarantee of recovery.
         </p>
       </div>
 
