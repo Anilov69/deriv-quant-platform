@@ -372,6 +372,10 @@ export default function MeshHedgePage(props: Props): ReactElement {
   const maybeTrade = useCallback(async () => {
     if (!armedRef.current || execRef.current || coolingRef.current || finalizingRef.current) return;
     if (!sessionRef.current) return;
+    if (!symbolRef.current) {
+      setPhase("Select a market to scan");
+      return;
+    }
     const evaluation = evaluateMesh(quotesRef.current, decimalsRef.current, lookbacksRef.current, stepFilterRef.current);
     const required = Math.max(...lookbacksRef.current);
     if (evaluation.digits.length < required) return;
