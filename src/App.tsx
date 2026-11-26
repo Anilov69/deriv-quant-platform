@@ -4,6 +4,9 @@ import { DerivSession, validAppId } from "@/deriv";
 import type { Account, Contract, Status, SymbolInfo } from "@/deriv";
 import { buildCandidates, rank } from "@/ladder";
 import type { Candidate, RankedQuote } from "@/ladder";
+import { AutoTrader } from "@/autotrade";
+import type { Snapshot } from "@/autotrade";
+import AutoTradePanel from "@/AutoTradePanel";
 import {
   digitsFrom,
   entropyBits,
@@ -111,6 +114,10 @@ export default function App(): ReactElement {
   const restoredRef = useRef(false);
   const quoteIdsRef = useRef(new Map<string, string>());
   const candidatesRef = useRef<Candidate[]>([]);
+  const snapshotRef = useRef<Snapshot | null>(null);
+  const balanceRef = useRef<number | null>(null);
+  const currencyRef = useRef("USD");
+  const autoRef = useRef<AutoTrader | null>(null);
 
   const [status, setStatus] = useState<Status>("idle");
   const [detail, setDetail] = useState("Not connected");
@@ -142,7 +149,10 @@ export default function App(): ReactElement {
       setStatus(next);
       setDetail(text);
     };
-    session.onTick = (tick) => setPrices((previous) => [...previous.slice(-500), tick.quote]);
+    session.onTick = (tick) => {
+      setPrices((previous) => [...previous.slice(-500), tick.quote]);
+      autoRef.current?.onTick();
+    };
     session.onSymbols = (list) => setSymbols(list);
     session.onBalance = (value, code) => {
       setBalance(value);
@@ -150,6 +160,7 @@ export default function App(): ReactElement {
     };
     session.onError = (message) => setNotice({ tone: "bad", text: message });
     session.onContract = (payload) => {
+      autoRef.current?.onContractUpdate(payload);
       const next = toContract(payload);
       setPositions((previous) => {
         const copy = [...previous];
@@ -251,6 +262,49 @@ export default function App(): ReactElement {
   }, [family, model]);
 
   candidatesRef.current = candidates;
+  balanceRef.current = balance;
+  currencyRef.current = currency;
+  snapshotRef.current =
+    family !== null && symbol !== ""
+      ? {
+          symbol,
+          family,
+          probabilities: model.probabilities,
+          currentDigit: model.digits[model.digits.length - 1] ?? 0,
+          momentumZ: model.momentum,
+        }
+      : null;
+
+  const engine: AutoTrader =
+    autoRef.current ??
+    (autoRef.current = new AutoTrader({
+      snapshot: () => snapshotRef.current,
+      quote: async (input) => {
+        const session = sessionRef.current;
+        const snap = snapshotRef.current;
+        if (!session || !snap) throw new Error("Not connected to Deriv.");
+        return session.quote({
+          symbol: snap.symbol,
+          contract: input.contract,
+          barrier: input.barrier,
+          duration: input.duration,
+          stake: input.stake,
+          currency: currencyRef.current,
+        });
+      },
+      buy: async (id, price) => {
+        const session = sessionRef.current;
+        if (!session) throw new Error("Not connected to Deriv.");
+        return session.buy(id, price);
+      },
+      watch: async (contractId) => {
+        const session = sessionRef.current;
+        if (!session) throw new Error("Not connected to Deriv.");
+        await session.watch(contractId);
+      },
+      balance: () => balanceRef.current,
+      currency: () => currencyRef.current,
+    }));
 
   const refreshLadder = useCallback(async (): Promise<void> => {
     const session = sessionRef.current;
@@ -364,6 +418,7 @@ export default function App(): ReactElement {
   const topProbability = Math.max(...model.probabilities);
   const best = rows.find((row) => row.value) ?? rows[0] ?? null;
   const live = status === "live";
+  const accountKind: "demo" | "real" | "unknown" = accounts.find((item) => item.id === accountId)?.kind ?? "unknown";
 
   return (
     <div className="min-h-screen bg-ink text-slate-100">
@@ -668,6 +723,16 @@ export default function App(): ReactElement {
           </div>
         </aside>
       </main>
+
+      <AutoTradePanel
+        engine={engine}
+        connected={live}
+        accountKind={accountKind}
+        accountId={accountId}
+        balance={balance}
+        currency={currency}
+        symbol={symbol}
+      />
 
       <footer className="border-t border-line px-5 py-3 text-[11px] text-muted">
         Prices and payouts come from Deriv's New Options API over a single-use OTP socket. Synthetic indices

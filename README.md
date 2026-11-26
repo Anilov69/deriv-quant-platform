@@ -81,13 +81,45 @@ only in the `Authorization` header to `api.derivws.com`.
 
 Use a token scoped to reading and trading, and revoke it when you are done.
 
+## Auto-trade and martingale
+
+Arming **AUTO-TRADE** turns the ladder from a table into an execution loop:
+
+- **One contract at a time.** The loop only reaches a buy from a state where nothing
+  is open, and then awaits `proposal_open_contract` until `is_sold === 1` before it
+  can scan again. If settlement never arrives the engine halts; it never assumes a
+  trade closed and places another.
+- **Cooldown** of N seconds or N ticks runs after settlement, then the scan resumes.
+- **Scope** restricts which contract types may be bought (Rise/Fall, Even/Odd,
+  Over/Under, Matches/Differs), and the gate is either minimum expected value (%)
+  or minimum model win probability.
+- **Real accounts** require typing `REAL` into a confirmation dialog before the
+  engine arms. Auto-trade is never restored as ON after a reload, and changing the
+  account stops it.
+
+Martingale is off by default. When on it has two modes:
+
+| Mode | Next stake |
+| --- | --- |
+| Payout-adjusted | `(cumulativeLoss + S0 * b) / b`, where `b = payout / stake - 1` is read from the live proposal for the exact contract being bought |
+| Fixed multiplier | `S0 * multiplier ^ step` |
+
+Because `b` is a net ratio, the same formula adapts from ~1.95x Rise/Fall to a 1.4x
+Over/Under or an 8.9x one-tick match. A win, or reaching the step cap, resets the
+ladder to `S0`. The preview table prices the streak at the gate's win rate, and the
+daily loss limit / profit target stop the engine and reset the ladder.
+
+The maths is pure: `planStake`, `settleBook` and `previewSteps` in
+`src/autotrade.ts`, covered by `tests/autotrade.test.ts` — including the lock test
+that asserts a second buy cannot happen before settlement.
+
 ## Local development
 
 ```bash
 npm install
 npm run dev        # http://127.0.0.1:3100
 npm run typecheck
-npm test           # estimators + transport contract
+npm test           # estimators, transport contract, auto-trade lock
 npm run build
 ```
 
@@ -110,3 +142,7 @@ publishes `dist/` to the `gh-pages` branch. GitHub Pages serves that branch at `
 - **Live trading is untested end to end.** The transport is verified against the
   public socket and the request shapes are asserted in tests, but no real-money
   order has been placed from this repo.
+- **Auto-trade never improves the expected value of a contract.** It can only
+  execute rows the model already prices above break-even; martingale changes the
+  distribution of outcomes, not the sign of the edge, and a losing run grows the
+  stake until the step cap or a kill-switch ends it.
