@@ -336,7 +336,7 @@ export default function AutoTradePanel(props: Props): ReactElement {
 
         <div className="space-y-3">
           <div className="flex items-center justify-between">
-            <h3 className="text-[11px] font-semibold tracking-wide text-slate-200">MARTINGALE &amp; RISK</h3>
+            <h3 className="text-[11px] font-semibold tracking-wide text-slate-200">EXECUTION &amp; RISK</h3>
             <button
               type="button"
               aria-pressed={martOn}
@@ -347,6 +347,9 @@ export default function AutoTradePanel(props: Props): ReactElement {
             </button>
           </div>
 
+          <p className="text-[10px] text-muted">
+            Off: every trade uses the flat base stake. Fractional Kelly sizing is not implemented.
+          </p>
           <div className="flex items-center gap-3 text-[11px] text-slate-200">
             <label className="flex items-center gap-1">
               <input type="radio" name="martmode" checked={martMode === "payout"} onChange={() => setMartMode("payout")} className="accent-[#4ade80]" /> Payout-adjusted
