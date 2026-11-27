@@ -14,6 +14,7 @@ import ParoliSniperPage from "@/pages/ParoliSniperPage";
 import TimeCollarPage from "@/pages/TimeCollarPage";
 import QuantDeskPage from "@/pages/QuantDeskPage";
 import PhoenixEnginePage from "@/pages/PhoenixEnginePage";
+import ChronoVaultPage from "@/pages/ChronoVaultPage";
 import {
   digitsFrom,
   entropyBits,
@@ -38,7 +39,7 @@ interface Notice {
   text: string;
 }
 
-type Route = "home" | "gap" | "mesh" | "straddle" | "paroli" | "collar" | "quant" | "phoenix";
+type Route = "home" | "gap" | "mesh" | "straddle" | "paroli" | "collar" | "quant" | "phoenix" | "chrono";
 
 /** GitHub Pages has no server-side routing, so the page lives in the hash. */
 function readRoute(): Route {
@@ -50,6 +51,7 @@ function readRoute(): Route {
   if (path === "time-collar") return "collar";
   if (path === "quant-desk") return "quant";
   if (path === "phoenix-engine") return "phoenix";
+  if (path === "chrono-vault") return "chrono";
   return "home";
 }
 
@@ -174,6 +176,7 @@ export default function App(): ReactElement {
   const collarContractRef = useRef<((payload: any) => void) | null>(null);
   const quantContractRef = useRef<((payload: unknown) => void) | null>(null);
   const phoenixContractRef = useRef<((payload: unknown) => void) | null>(null);
+  const chronoContractRef = useRef<((payload: unknown) => void) | null>(null);
   const quantNavigationGuardRef = useRef<(() => string | null) | null>(null);
 
   useEffect(() => {
@@ -223,6 +226,7 @@ export default function App(): ReactElement {
       collarContractRef.current?.(payload);
       quantContractRef.current?.(payload);
       phoenixContractRef.current?.(payload);
+      chronoContractRef.current?.(payload);
       if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
@@ -286,6 +290,10 @@ export default function App(): ReactElement {
 
   const bindPhoenixContractListener = useCallback((handler: ((payload: unknown) => void) | null) => {
     phoenixContractRef.current = handler;
+  }, []);
+
+  const bindChronoContractListener = useCallback((handler: ((payload: unknown) => void) | null) => {
+    chronoContractRef.current = handler;
   }, []);
 
   const bindQuantContractListener = useCallback((handler: ((payload: unknown) => void) | null) => {
@@ -575,6 +583,9 @@ export default function App(): ReactElement {
           <a href="#/phoenix-engine" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "phoenix" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Phoenix Engine
           </a>
+          <a href="#/chrono-vault" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "chrono" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Chrono-Vault
+          </a>
         </nav>
         <div className="flex items-center gap-3 text-xs">
           <span className={"rounded-full border px-3 py-1 " + (live ? "border-accent/40 text-accent" : status === "error" ? "border-danger/40 text-danger" : "border-line text-muted")}>
@@ -758,6 +769,21 @@ export default function App(): ReactElement {
           onAccountChange={switchAccount}
           onNotice={notify}
           bindContractListener={bindPhoenixContractListener}
+        />
+      ) : route === "chrono" ? (
+        <ChronoVaultPage
+          sessionRef={sessionRef}
+          connected={live}
+          symbols={symbols}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindChronoContractListener}
         />
       ) : (
         <>

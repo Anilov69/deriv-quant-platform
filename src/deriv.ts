@@ -49,6 +49,14 @@ export interface QuoteRequest {
   currency: string;
 }
 
+export interface AccumulatorQuoteRequest {
+  symbol: string;
+  stake: number;
+  currency: string;
+  growthRate: number;
+  takeProfit: number;
+}
+
 export interface Contract {
   id: number;
   symbol: string;
@@ -454,6 +462,21 @@ export class DerivSession {
 
   async quote(input: QuoteRequest): Promise<Quote> {
     return this.toQuote(await this.sendProposal(this.proposalPayload(input)));
+  }
+
+  async quoteAccumulator(input: AccumulatorQuoteRequest): Promise<Quote> {
+    const payload: Record<string, unknown> = {
+      proposal: 1,
+      amount: input.stake,
+      basis: "stake",
+      contract_type: "ACCU",
+      currency: input.currency,
+      underlying_symbol: input.symbol,
+      growth_rate: input.growthRate,
+      limit_order: { take_profit: input.takeProfit },
+    };
+    // Intentionally no duration or duration_unit fields: Deriv rejects ACCU requests that include them.
+    return this.toQuote(await this.sendProposal(payload));
   }
 
   /**
