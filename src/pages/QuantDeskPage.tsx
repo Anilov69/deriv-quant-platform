@@ -1522,7 +1522,7 @@ export default function QuantDeskPage({
               </div>
               <div className="flex items-center gap-1.5">
                 <span className={"rounded border px-2 py-1 text-[8px] font-semibold tracking-wide " + (earlyExit ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-200" : "border-line bg-ink text-muted")}>
-                  {earlyExit ? "EARLY HARVEST ON" : "HOLD TO EXPIRY"}
+                  {earlyExit ? "EARLY HARVEST (+" + effectiveCapturePct.toFixed(0) + "%)" : "FULL EXPIRY"}
                 </span>
                 {active ? <span className="rounded border border-accent/40 bg-accent/10 px-2 py-1 font-mono text-[8px] text-accent">#{active.id}</span> : null}
               </div>
