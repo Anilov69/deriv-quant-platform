@@ -174,6 +174,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ10V");
   const [capabilities, setCapabilities] = useState<Record<string, CapabilityRow>>({});
   const [history, setHistory] = useState<Tick[]>([]);
+  const [warmBufferStatus, setWarmBufferStatus] = useState<string | null>(null);
   const [spot, setSpot] = useState<number>(0);
   const [atr15, setAtr15] = useState<number>(0);
   const [atr100, setAtr100] = useState<number>(0);
@@ -211,6 +212,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const buyPriceRef = useRef<Map<number, number>>(new Map<number, number>());
   const sellSentRef = useRef<Set<number>>(new Set<number>());
   const ticksRef = useRef<Tick[]>([]);
+  const tickCacheRef = useRef<Record<string, number[]>>({});
   const radarSubsRef = useRef<Map<string, string>>(new Map<string, string>());
   const reqIdCounterRef = useRef(0);
   const cooldownTimerRef = useRef<number | undefined>(undefined);
@@ -462,37 +464,73 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
 
   useEffect(() => {
     if (!connected) return;
-    for (const symbol of PHOENIX_SYMBOLS) void discoverCapabilities(symbol);
-  }, [connected, discoverCapabilities, accountId]);
+    void discoverCapabilities(selectedSymbol);
+  }, [connected, selectedSymbol, discoverCapabilities]);
 
   const startFeed = useCallback(async (symbol: string): Promise<void> => {
     const session = sessionRef.current;
     if (!session || !connectedRef.current) return;
-    if (radarSubsRef.current.has(symbol)) return;
-    try {
+
+    const oldSubscriptionId = radarSubsRef.current.get(symbol);
+    if (oldSubscriptionId) {
       ++reqIdCounterRef.current;
-      const historyTicks = await session.history(symbol, 100, "ticks");
-      if (!aliveRef.current) return;
-      ticksRef.current = historyTicks;
-      setHistory(historyTicks);
-      const quotes = historyTicks.map((tick) => tick.quote).filter((quote) => Number.isFinite(quote) && quote > 0);
-      const recent = quotes.slice(-15);
-      const long = quotes.slice(-100);
+      await session.forget(oldSubscriptionId);
+      radarSubsRef.current.delete(symbol);
+    }
+
+    const cachedQuotes = tickCacheRef.current[symbol];
+    if (cachedQuotes && cachedQuotes.length > 0) {
+      const cachedTicks = cachedQuotes.map((quote, index) => ({ quote, epoch: Date.now() - (cachedQuotes.length - index) }));
+      ticksRef.current = cachedTicks;
+      setHistory(cachedTicks);
       const range = (rows: readonly number[]): number => {
         if (rows.length < 2) return 0;
         let sum = 0;
         for (let index = 1; index < rows.length; index += 1) sum += Math.abs(rows[index] - rows[index - 1]);
         return sum / (rows.length - 1);
       };
-      setAtr15(range(recent));
-      setAtr100(range(long));
-      if (quotes.length > 0) setSpot(quotes[quotes.length - 1]);
+      setAtr15(range(cachedQuotes.slice(-15)));
+      setAtr100(range(cachedQuotes.slice(-100)));
+      setSpot(cachedQuotes[cachedQuotes.length - 1] ?? 0);
+      setWarmBufferStatus(null);
+    } else {
+      try {
+        ++reqIdCounterRef.current;
+        const historyTicks = await session.history(symbol, 100, "ticks");
+        if (!aliveRef.current || selectedRef.current !== symbol) return;
+        const quotes = historyTicks.map((tick) => tick.quote).filter((quote) => Number.isFinite(quote) && quote > 0).slice(-120);
+        tickCacheRef.current[symbol] = quotes;
+        ticksRef.current = historyTicks.slice(-120);
+        setHistory(historyTicks.slice(-120));
+        const range = (rows: readonly number[]): number => {
+          if (rows.length < 2) return 0;
+          let sum = 0;
+          for (let index = 1; index < rows.length; index += 1) sum += Math.abs(rows[index] - rows[index - 1]);
+          return sum / (rows.length - 1);
+        };
+        setAtr15(range(quotes.slice(-15)));
+        setAtr100(range(quotes.slice(-100)));
+        if (quotes.length > 0) setSpot(quotes[quotes.length - 1]);
+      } catch (error) {
+        const code = (error as { code?: unknown } | null)?.code ?? "";
+        if (String(code).toLowerCase() === "ratelimit") {
+          setWarmBufferStatus("Warming live buffer: 0/15 ticks...");
+        } else {
+          setWarmBufferStatus("Warming live buffer: 0/15 ticks...");
+        }
+      }
+    }
+
+    try {
       ++reqIdCounterRef.current;
       const subscriptionId = await session.subscribeTicksFor(symbol);
-      if (!subscriptionId) return;
-      radarSubsRef.current.set(symbol, subscriptionId);
+      if (!aliveRef.current || selectedRef.current !== symbol) {
+        if (subscriptionId) void session.forget(subscriptionId);
+        return;
+      }
+      if (subscriptionId) radarSubsRef.current.set(symbol, subscriptionId);
     } catch (error) {
-      onNotice("Phoenix feed failed for " + symbol + ": " + (error instanceof Error ? error.message : String(error)), "bad");
+      onNotice("Phoenix tick stream failed for " + symbol + ": " + (error instanceof Error ? error.message : String(error)), "bad");
     }
   }, [onNotice, sessionRef]);
 
@@ -503,10 +541,20 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     const handler = (symbol: string, tick: Tick): void => {
       if (symbol !== selectedRef.current) return;
       const previous = ticksRef.current[ticksRef.current.length - 1]?.quote ?? tick.quote;
-      ticksRef.current = [...ticksRef.current.slice(-100), tick];
+      const quote = Number(tick.quote);
+      if (!Number.isFinite(quote) || quote <= 0) return;
+      ticksRef.current = [...ticksRef.current.slice(-119), { ...tick, quote }];
       setHistory(ticksRef.current);
-      setSpot(tick.quote);
-      const quotes = ticksRef.current.map((item) => item.quote);
+      setSpot(quote);
+      const quotes = tickCacheRef.current[selectedRef.current]
+        ? [...tickCacheRef.current[selectedRef.current], quote].slice(-120)
+        : ticksRef.current.map((item) => item.quote).slice(-120);
+      tickCacheRef.current[selectedRef.current] = quotes;
+      if (warmBufferStatus !== null) {
+        const liveCount = quotes.length;
+        if (liveCount >= 15) setWarmBufferStatus(null);
+        else setWarmBufferStatus("Warming live buffer: " + liveCount + "/15 ticks...");
+      }
       const range = (rows: readonly number[]): number => {
         if (rows.length < 2) return 0;
         let sum = 0;
@@ -559,10 +607,14 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     void startFeed(selectedSymbol);
     return () => {
       if (session.onTickFor === handler) session.onTickFor = null;
-      for (const id of radarSubsRef.current.values()) void session.forget(id);
-      radarSubsRef.current.clear();
+      const subscriptionId = radarSubsRef.current.get(selectedSymbol);
+      if (subscriptionId) {
+        ++reqIdCounterRef.current;
+        void session.forget(subscriptionId);
+        radarSubsRef.current.delete(selectedSymbol);
+      }
     };
-  }, [accountId, connected, runDecision, selectedSymbol, sessionRef, startFeed]);
+  }, [connected, selectedSymbol]);
 
   const resolveBarrier = useCallback((symbol: string, contractType: "TURBOSLONG" | "TURBOSSHORT" | "ONETOUCH" | "NOTOUCH" | "VANILLA", side: "ko" | "touch" | "atm"): number => {
     void symbol;
@@ -750,6 +802,11 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
               <span className="rounded border border-line bg-ink/60 px-2 py-1 font-mono text-[10px] text-slate-200">{balance === null ? "-" : "$" + balance.toFixed(2)} {currency}</span>
             </div>
           </div>
+          {warmBufferStatus ? (
+            <div className="mt-3 rounded border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-[11px] text-amber-200">
+              {warmBufferStatus}
+            </div>
+          ) : null}
           <div className="mt-3 flex flex-wrap items-center justify-between gap-2 rounded border border-line bg-ink/50 px-3 py-2">
             <div>
               <p className="text-[9px] font-bold uppercase tracking-widest text-muted">Engine phase</p>
