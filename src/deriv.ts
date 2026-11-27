@@ -43,6 +43,8 @@ export interface QuoteRequest {
   contract: string;
   barrier?: string;
   duration: number;
+  /** Defaults to ticks so Pages 1 and 2 keep their existing behavior. */
+  durationUnit?: "t" | "s" | "m";
   stake: number;
   currency: string;
 }
@@ -332,8 +334,9 @@ export class DerivSession {
     return symbols;
   }
 
-  async contractsFor(symbol: string, currency: string): Promise<ContractOffer[]> {
-    const message = await this.send({ contracts_for: symbol, currency, product_type: "basic" });
+  async contractsFor(symbol: string): Promise<ContractOffer[]> {
+    // Deriv rejects currency/product_type here. Send only the symbol.
+    const message = await this.send({ contracts_for: symbol });
     const rows: unknown[] = Array.isArray(message?.contracts_for?.available) ? message.contracts_for.available : [];
     return rows.map((row) => {
       const item = typeof row === "object" && row !== null ? (row as Record<string, unknown>) : {};
@@ -405,7 +408,7 @@ export class DerivSession {
       contract_type: input.contract,
       currency: input.currency,
       duration: input.duration,
-      duration_unit: "t",
+      duration_unit: input.durationUnit ?? "t",
       underlying_symbol: input.symbol,
     };
     if (input.barrier !== undefined) payload.barrier = input.barrier;

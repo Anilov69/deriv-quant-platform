@@ -124,7 +124,7 @@ const STRADDLE_CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
       "You ran from Level 0 through your Martingale cap without a single winning leg. A straddle can lose every round when the market stays inside both barriers; that is variance, not a broken signal. Take a 15-minute break before placing another trade.",
     bullets: [
       'Never restart at a higher stake or tighter barrier after a 0-win stop-out.',
-      'After the cooldown, verify contracts_for still offers tick ONETOUCH and run a few Demo rounds before returning to Real.',
+      'After the cooldown, verify contracts_for still offers ONETOUCH in a supported duration and run a few Demo rounds before returning to Real.',
     ],
     shell: 'border-danger/60',
     badgeTone: 'bg-danger text-ink',

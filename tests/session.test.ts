@@ -63,6 +63,36 @@ class MockSocket {
       this.emit({ msg_type: "tick", tick: { epoch: 1, quote: 446.62 }, subscription: { id: "tick-1" }, ...req });
     } else if (payload.ticks_history !== undefined) {
       this.emit({ history: { prices: [446.6, 446.61, 446.62], times: [1, 2, 3] }, ...req });
+    } else if (payload.contracts_for !== undefined) {
+      this.emit({
+        contracts_for: {
+          available: [
+            {
+              contract_type: "ONETOUCH",
+              contract_category: "touch",
+              min_contract_duration: "15s",
+              max_contract_duration: "60s",
+              expiry_type: "intraday",
+              barrier: "+0.14",
+              default_stake: 0.35,
+              pip_size: 0.01,
+              underlying_symbol: payload.contracts_for,
+            },
+            {
+              contract_type: "DIGITMATCH",
+              contract_category: "digits",
+              min_contract_duration: "1t",
+              max_contract_duration: "10t",
+              expiry_type: "tick",
+              barrier: null,
+              default_stake: 1,
+              pip_size: 0.01,
+              underlying_symbol: payload.contracts_for,
+            },
+          ],
+        },
+        ...req,
+      });
     } else if (payload.proposal !== undefined) {
       this.emit({ proposal: { id: "quote-1", ask_price: 1, payout: 8.93, spot: 446.62 }, ...req });
     } else if (payload.buy !== undefined) {
@@ -167,6 +197,30 @@ describe("requests", () => {
     expect(symbols.map((symbol) => symbol.symbol).sort()).toEqual(["JD10", "R_100", "stpRNG2"]);
     const step = symbols.find((symbol) => symbol.symbol === "stpRNG2");
     expect(step).toMatchObject({ name: "Step Index 2", family: "step", pip: 0.1 });
+  });
+
+  it("requests contracts_for with only the symbol and parses duration units", async () => {
+    const { session, socket } = await connect();
+    const offers = await session.contractsFor("R_100");
+    const frame = socket.sent.find((item) => item.contracts_for !== undefined);
+    expect(frame).toMatchObject({ contracts_for: "R_100" });
+    expect(Object.keys(frame ?? {}).sort()).toEqual(["contracts_for", "req_id"]);
+    expect(frame).not.toHaveProperty("currency");
+    expect(frame).not.toHaveProperty("product_type");
+    expect(offers.find((offer) => offer.contractType === "ONETOUCH")).toMatchObject({
+      minContractDuration: "15s",
+      maxContractDuration: "60s",
+      expiryType: "intraday",
+    });
+  });
+
+  it("sends the ONETOUCH duration unit and defaults other pages to ticks", async () => {
+    const { session, socket } = await connect();
+    await session.quote({ symbol: "R_100", contract: "ONETOUCH", barrier: "+0.14", duration: 30, durationUnit: "s", stake: 0.35, currency: "USD" });
+    await session.quote({ symbol: "R_100", contract: "DIGITMATCH", barrier: "3", duration: 1, stake: 1, currency: "USD" });
+    const frames = socket.sent.filter((item) => item.proposal !== undefined);
+    expect(frames[0]).toMatchObject({ duration: 30, duration_unit: "s" });
+    expect(frames[1]).toMatchObject({ duration: 1, duration_unit: "t" });
   });
 
   it("quotes with underlying_symbol and buys that exact quote at a numeric price", async () => {

@@ -26,6 +26,10 @@ export const MIN_LEG_STAKE = 0.35;
 export const STAKE_STEP = 0.05;
 export const DEFAULT_DURATION_TICKS = 5;
 export const MAX_DURATION_TICKS = 15;
+export const DEFAULT_DURATION_SECONDS = 30;
+export const DEFAULT_DURATION_MINUTES = 2;
+export const MAX_DURATION_SECONDS = 86400;
+export const MAX_DURATION_MINUTES = 1440;
 export const ATR_FAST_WINDOW = 10;
 export const ATR_BASELINE_WINDOW = 50;
 export const ATR_BUFFER_SIZE = 100;
@@ -88,11 +92,48 @@ export function roundQuarter(value: number): number {
   return Math.max(0.25, roundToStep(value, 0.25));
 }
 
-export function parseTickContractDuration(value: string): number | null {
-  const match = /^(\d+(?:\.\d+)?)\s*t$/i.exec(value.trim());
+export type TouchDurationUnit = "t" | "s" | "m";
+
+export interface TouchDuration {
+  value: number;
+  unit: TouchDurationUnit;
+}
+
+export function parseTouchContractDuration(value: string): TouchDuration | null {
+  const match = /^(\d+(?:\.\d+)?)\s*([tsm])$/i.exec(value.trim());
   if (!match) return null;
-  const ticks = Number(match[1]);
-  return Number.isFinite(ticks) && ticks > 0 ? ticks : null;
+  const amount = Number(match[1]);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  return { value: amount, unit: match[2].toLowerCase() as TouchDurationUnit };
+}
+
+export function durationUnitLabel(unit: TouchDurationUnit): string {
+  return unit === "t" ? "ticks" : unit === "s" ? "seconds" : "minutes";
+}
+
+export function durationUnitSuffix(unit: TouchDurationUnit): string {
+  return unit;
+}
+
+export function formatTouchDuration(value: number, unit: TouchDurationUnit): string {
+  const label = durationUnitLabel(unit);
+  return value === 1 ? value + " " + label.slice(0, -1) : value + " " + label;
+}
+
+export function formatTouchDurationShort(value: number, unit: TouchDurationUnit): string {
+  return value + durationUnitSuffix(unit);
+}
+
+export function touchDurationToSeconds(value: number, unit: TouchDurationUnit): number | null {
+  if (unit === "s") return value;
+  if (unit === "m") return value * 60;
+  return null;
+}
+
+export function maxTouchDuration(unit: TouchDurationUnit): number {
+  if (unit === "t") return MAX_DURATION_TICKS;
+  if (unit === "s") return MAX_DURATION_SECONDS;
+  return MAX_DURATION_MINUTES;
 }
 
 function parseBarrierOffset(value: string | null): number {
@@ -102,8 +143,9 @@ function parseBarrierOffset(value: string | null): number {
 }
 
 export interface TouchContractSpec {
-  minTicks: number;
-  maxTicks: number;
+  minDuration: number;
+  maxDuration: number;
+  unit: TouchDurationUnit;
   defaultBarrier: number;
   pipSize: number;
   offer: ContractOffer;
@@ -111,44 +153,83 @@ export interface TouchContractSpec {
   otherTenors: string[];
 }
 
+interface TouchDurationCandidate {
+  offer: ContractOffer;
+  min: TouchDuration;
+  max: TouchDuration;
+  unit: TouchDurationUnit;
+}
+
+function durationInUnit(duration: TouchDuration, unit: TouchDurationUnit): number | null {
+  if (duration.unit === unit) return duration.value;
+  if (duration.unit === "t" || unit === "t") return null;
+  if (unit === "s") return duration.value * 60;
+  return duration.value / 60;
+}
+
+function durationCandidate(offer: ContractOffer): TouchDurationCandidate | null {
+  const min = parseTouchContractDuration(offer.minContractDuration);
+  const max = parseTouchContractDuration(offer.maxContractDuration);
+  if (!min || !max) return null;
+  // Some symbols publish a seconds minimum with a minutes maximum. Normalise
+  // cross-unit bounds to seconds so the published window remains usable.
+  const unit: TouchDurationUnit = min.unit === max.unit ? min.unit : min.unit === "t" || max.unit === "t" ? min.unit : "s";
+  const minValue = durationInUnit(min, unit);
+  const maxValue = durationInUnit(max, unit);
+  if (minValue === null || maxValue === null || !Number.isFinite(minValue) || !Number.isFinite(maxValue) || minValue <= 0 || maxValue <= 0 || minValue > maxValue) {
+    return null;
+  }
+  const upper = Math.min(maxValue, maxTouchDuration(unit));
+  if (minValue > upper) return null;
+  return { offer, min: { value: minValue, unit }, max: { value: upper, unit }, unit };
+}
+
 /**
- * Finds the tick-expiry ONETOUCH contract. The page must never assume every
- * listed market offers it: Deriv currently omits tick ONETOUCH on jump and step
- * indices even though data and digit contracts exist there.
+ * Finds an ONETOUCH contract with a duration this page can price. Tick
+ * ONETOUCH is preferred for the tick monitor, but some symbols publish only
+ * seconds or minutes, so those tenors are a first-class fallback.
  */
-export function selectOnetouchTickSpec(offers: readonly ContractOffer[], fallbackPip = 0.01): TouchContractSpec | null {
+export function selectOnetouchSpec(offers: readonly ContractOffer[], fallbackPip = 0.01): TouchContractSpec | null {
   const touch = offers.filter((offer) => offer.contractType.toUpperCase() === "ONETOUCH");
-  const tick = touch
-    .filter((offer) => offer.expiryType.toLowerCase() === "tick")
-    .map((offer) => ({
-      offer,
-      min: parseTickContractDuration(offer.minContractDuration),
-      max: parseTickContractDuration(offer.maxContractDuration),
-    }))
-    .filter(
-      (entry): entry is { offer: ContractOffer; min: number; max: number } =>
-        entry.min !== null && entry.max !== null && entry.max >= entry.min && entry.min <= MAX_DURATION_TICKS,
-    )
-    .sort((a, b) => a.min - b.min || a.max - b.max)[0];
-  if (!tick) return null;
-  const maxTicks = Math.min(MAX_DURATION_TICKS, Math.max(tick.min, tick.max));
-  const minTicks = Math.min(tick.min, maxTicks);
-  const pipSize = tick.offer.pipSize > 0 ? tick.offer.pipSize : fallbackPip > 0 ? fallbackPip : 0.01;
+  const candidates = touch
+    .map(durationCandidate)
+    .filter((entry): entry is TouchDurationCandidate => entry !== null);
+  const ticks = candidates.filter((entry) => entry.unit === "t").sort((a, b) => a.min.value - b.min.value || a.max.value - b.max.value);
+  const timed = candidates
+    .filter((entry) => entry.unit !== "t")
+    .sort((a, b) => {
+      const left = (touchDurationToSeconds(a.min.value, a.unit) ?? Number.MAX_SAFE_INTEGER);
+      const right = (touchDurationToSeconds(b.min.value, b.unit) ?? Number.MAX_SAFE_INTEGER);
+      return left - right || a.min.value - b.min.value;
+    });
+  const selected = ticks[0] ?? timed[0];
+  if (!selected) return null;
+  const pipSize = selected.offer.pipSize > 0 ? selected.offer.pipSize : fallbackPip > 0 ? fallbackPip : 0.01;
   return {
-    minTicks,
-    maxTicks,
-    defaultBarrier: parseBarrierOffset(tick.offer.barrier),
+    minDuration: selected.min.value,
+    maxDuration: selected.max.value,
+    unit: selected.unit,
+    defaultBarrier: parseBarrierOffset(selected.offer.barrier),
     pipSize,
-    offer: tick.offer,
+    offer: selected.offer,
     otherTenors: touch
-      .filter((offer) => offer.expiryType.toLowerCase() !== "tick")
+      .filter((offer) => offer !== selected.offer)
       .map((offer) => offer.expiryType + " (" + offer.minContractDuration + "-" + offer.maxContractDuration + ")"),
   };
 }
 
+export function defaultTouchDuration(spec: TouchContractSpec): number {
+  const preferred = spec.unit === "t" ? DEFAULT_DURATION_TICKS : spec.unit === "s" ? DEFAULT_DURATION_SECONDS : DEFAULT_DURATION_MINUTES;
+  return clampTouchDuration(preferred, spec);
+}
+
 export function clampTouchDuration(requested: number, spec: TouchContractSpec | null): number {
   if (!spec) return Math.min(MAX_DURATION_TICKS, Math.max(1, Math.round(requested)));
-  return Math.min(spec.maxTicks, Math.max(spec.minTicks, Math.round(requested)));
+  return Math.min(spec.maxDuration, Math.max(spec.minDuration, Math.round(requested)));
+}
+
+export function formatTouchDurationRange(spec: TouchContractSpec): string {
+  return spec.minDuration + "-" + spec.maxDuration + " " + durationUnitLabel(spec.unit);
 }
 
 export function barrierOffsetFor(

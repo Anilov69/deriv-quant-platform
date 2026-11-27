@@ -25,19 +25,27 @@ import {
   computeAtrSqueeze,
   computeStraddleRiskPlan,
   decimalsForStep,
+  defaultTouchDuration,
+  durationUnitLabel,
+  durationUnitSuffix,
   formatSignedBarrier,
+  formatTouchDuration,
+  formatTouchDurationRange,
+  formatTouchDurationShort,
   isSqueezeReady,
   nextStraddleCost,
   nextStraddleLevel,
   round2,
   roundToStep,
-  selectOnetouchTickSpec,
+  selectOnetouchSpec,
+  touchDurationToSeconds,
 } from "@/utils/straddleMath";
 import type {
   BarrierPreset,
   StraddleOutcome,
   StraddleRiskPlan,
   TouchContractSpec,
+  TouchDurationUnit,
 } from "@/utils/straddleMath";
 
 type ConfirmMode = "auto" | "single";
@@ -75,6 +83,7 @@ interface ActiveBundle {
   symbol: string;
   level: number;
   duration: number;
+  durationUnit: TouchDurationUnit;
   cost: number;
   squeezeRatio: number;
   barrierOffset: number;
@@ -91,6 +100,7 @@ interface RoundRow {
   symbol: string;
   level: number;
   duration: number;
+  durationUnit: TouchDurationUnit;
   upperBarrier: string;
   lowerBarrier: string;
   squeezeRatio: number;
@@ -115,6 +125,7 @@ interface RuntimeConfig {
   accountId: string;
   symbol: string;
   duration: number;
+  durationUnit: TouchDurationUnit;
   baseStake: number;
   currency: string;
   spec: TouchContractSpec | null;
@@ -157,8 +168,21 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
-function quoteKeyFor(symbol: string, duration: number, offset: number, decimals: number, stake: number): string {
-  return [symbol, duration, offset.toFixed(decimals), stake.toFixed(2)].join("|");
+function quoteKeyFor(
+  symbol: string,
+  duration: number,
+  durationUnit: TouchDurationUnit,
+  offset: number,
+  decimals: number,
+  stake: number,
+): string {
+  return [symbol, duration, durationUnit, offset.toFixed(decimals), stake.toFixed(2)].join("|");
+}
+
+function formatElapsed(seconds: number): string {
+  const safe = Math.max(0, Math.floor(seconds));
+  const minutes = Math.floor(safe / 60);
+  return minutes + ":" + String(safe % 60).padStart(2, "0");
 }
 
 function isSold(payload: any): boolean {
@@ -261,6 +285,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
 
   const aliveRef = useRef(true);
   const pricesRef = useRef<number[]>([]);
+  const durationUnitRef = useRef<TouchDurationUnit>("t");
   const runtimeRef = useRef<RuntimeConfig | null>(null);
   const armedRef = useRef(false);
   const execRef = useRef(false);
@@ -288,10 +313,11 @@ export default function TouchStraddlePage(props: Props): ReactElement {
 
   const symbolInfo = useMemo(() => symbols.find((item) => item.symbol === symbol) ?? null, [symbol, symbols]);
   const symbolPip = symbolInfo?.pip && symbolInfo.pip > 0 ? symbolInfo.pip : 0.01;
-  const spec = useMemo(() => selectOnetouchTickSpec(offers, symbolPip), [offers, symbolPip]);
+  const spec = useMemo(() => selectOnetouchSpec(offers, symbolPip), [offers, symbolPip]);
   const pip = spec?.pipSize && spec.pipSize > 0 ? spec.pipSize : symbolPip;
   const decimals = Math.max(0, decimalsForStep(pip));
   const effectiveDuration = spec ? clampTouchDuration(duration, spec) : duration;
+  const durationUnit: TouchDurationUnit = spec?.unit ?? "t";
   const atr = useMemo(() => computeAtrSqueeze(prices), [prices]);
   const spot = prices.length > 0 ? prices[prices.length - 1] : 0;
   const ready = atr.ready;
@@ -308,7 +334,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
     multiplierChoice === "custom"
       ? clamp(customMultiplier, 1.05, 5)
       : Number(multiplierChoice);
-  const quoteKey = quoteKeyFor(symbol, effectiveDuration, barrierOffset, decimals, cleanBase);
+  const quoteKey = quoteKeyFor(symbol, effectiveDuration, durationUnit, barrierOffset, decimals, cleanBase);
   const livePreview = preview && preview.key === quoteKey ? preview : null;
   const singleSidePayout = livePreview ? Math.min(livePreview.upper.payout, livePreview.lower.payout) : null;
   const riskPlan: StraddleRiskPlan = useMemo(
@@ -337,6 +363,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
     accountId,
     symbol,
     duration: effectiveDuration,
+    durationUnit,
     baseStake: cleanBase,
     currency,
     spec,
@@ -370,9 +397,14 @@ export default function TouchStraddlePage(props: Props): ReactElement {
 
   useEffect(() => {
     if (!spec) return;
-    setDuration((previous) => clampTouchDuration(previous, spec));
+    if (durationUnitRef.current !== spec.unit) {
+      durationUnitRef.current = spec.unit;
+      setDuration(defaultTouchDuration(spec));
+    } else {
+      setDuration((previous) => clampTouchDuration(previous, spec));
+    }
     if (!customOffsetTouchedRef.current && spec.defaultBarrier > 0) setCustomOffset(spec.defaultBarrier);
-  }, [duration, spec]);
+  }, [spec]);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -495,6 +527,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
         symbol: bundle.symbol,
         level: bundle.level,
         duration: bundle.duration,
+        durationUnit: bundle.durationUnit,
         upperBarrier: bundle.upperBarrier,
         lowerBarrier: bundle.lowerBarrier,
         squeezeRatio: bundle.squeezeRatio,
@@ -589,6 +622,9 @@ export default function TouchStraddlePage(props: Props): ReactElement {
 
   const armSettlementTimeout = useCallback(() => {
     if (settleTimerRef.current !== undefined) window.clearTimeout(settleTimerRef.current);
+    const bundle = bundleRef.current;
+    const durationSeconds = bundle ? touchDurationToSeconds(bundle.duration, bundle.durationUnit) : null;
+    const graceMs = durationSeconds !== null ? Math.max(SETTLEMENT_TIMEOUT_MS, durationSeconds * 1000 + 20000) : SETTLEMENT_TIMEOUT_MS;
     settleTimerRef.current = window.setTimeout(() => {
       if (activeIdsRef.current.size === 0) return;
       armedRef.current = false;
@@ -596,8 +632,13 @@ export default function TouchStraddlePage(props: Props): ReactElement {
       coolingRef.current = false;
       setCooling(false);
       setPhase("Settlement timeout - verify open contracts in Deriv");
-      onNotice("Settlement timeout: a straddle leg has not reported is_sold. The execution lock is still held; verify the open contract in Deriv and reload the page after it settles.", "bad");
-    }, SETTLEMENT_TIMEOUT_MS);
+      onNotice(
+        "Settlement timeout after " +
+          Math.round(graceMs / 1000) +
+          "s: a straddle leg has not reported is_sold. The execution lock is still held; verify the open contract in Deriv and reload the page after it settles.",
+        "bad",
+      );
+    }, graceMs);
   }, [onNotice]);
 
   const fireStraddle = useCallback(
@@ -605,7 +646,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
       const session = sessionRef.current;
       const cfg = runtimeRef.current;
       if (!session || !cfg || !cfg.spec) {
-        onNotice("Tick ONETOUCH is not available for this market right now.", "bad");
+        onNotice("ONETOUCH is not available in a supported duration for this market right now.", "bad");
         return;
       }
       if (!aliveRef.current || execRef.current || coolingRef.current || bundleRef.current || activeIdsRef.current.size > 0) return;
@@ -631,15 +672,19 @@ export default function TouchStraddlePage(props: Props): ReactElement {
         (mode === "single" || armedRef.current);
       try {
         setPhase("Checking contracts_for capability...");
-        const freshOffers = await session.contractsFor(cfg.symbol, cfg.currency);
+        const freshOffers = await session.contractsFor(cfg.symbol);
         if (!stillLive()) return;
-        const freshSpec = selectOnetouchTickSpec(freshOffers, cfg.pip);
-        if (!freshSpec) throw new Error("Deriv no longer offers tick ONETOUCH for " + cfg.symbol + ".");
+        const freshSpec = selectOnetouchSpec(freshOffers, cfg.pip);
+        if (!freshSpec) throw new Error("Deriv no longer offers ONETOUCH in a supported duration for " + cfg.symbol + ".");
         setOffers(freshOffers);
-        const freshDuration = clampTouchDuration(cfg.duration, freshSpec);
-        if (freshDuration !== cfg.duration) {
+        const freshDuration =
+          freshSpec.unit === cfg.durationUnit ? clampTouchDuration(cfg.duration, freshSpec) : defaultTouchDuration(freshSpec);
+        if (freshDuration !== cfg.duration || freshSpec.unit !== cfg.durationUnit) {
           setDuration(freshDuration);
-          onNotice("Deriv's tick ONETOUCH duration range changed; the straddle was clamped to " + freshDuration + " ticks.", "ok");
+          onNotice(
+            "Deriv's ONETOUCH duration changed; the straddle was set to " + formatTouchDuration(freshDuration, freshSpec.unit) + ".",
+            "ok",
+          );
         }
         const freshPip = freshSpec.pipSize > 0 ? freshSpec.pipSize : cfg.pip;
         const freshDecimals = decimalsForStep(freshPip);
@@ -653,8 +698,8 @@ export default function TouchStraddlePage(props: Props): ReactElement {
         }
         setPhase("Pricing both legs with live proposals...");
         const requests = [
-          { symbol: cfg.symbol, contract: "ONETOUCH", barrier: freshUpperQuery, duration: freshDuration, stake: cfg.baseStake, currency: cfg.currency },
-          { symbol: cfg.symbol, contract: "ONETOUCH", barrier: freshLowerQuery, duration: freshDuration, stake: cfg.baseStake, currency: cfg.currency },
+          { symbol: cfg.symbol, contract: "ONETOUCH", barrier: freshUpperQuery, duration: freshDuration, durationUnit: freshSpec.unit, stake: cfg.baseStake, currency: cfg.currency },
+          { symbol: cfg.symbol, contract: "ONETOUCH", barrier: freshLowerQuery, duration: freshDuration, durationUnit: freshSpec.unit, stake: cfg.baseStake, currency: cfg.currency },
         ];
         const quotes = await session.quoteBundle(requests);
         if (!stillLive()) return;
@@ -666,7 +711,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
           return;
         }
         setPreview({
-          key: quoteKeyFor(cfg.symbol, freshDuration, freshOffset, freshDecimals, cfg.baseStake),
+          key: quoteKeyFor(cfg.symbol, freshDuration, freshSpec.unit, freshOffset, freshDecimals, cfg.baseStake),
           upper: upperQuote,
           lower: lowerQuote,
           at: Date.now(),
@@ -719,6 +764,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
           symbol: cfg.symbol,
           level: currentLevel,
           duration: freshDuration,
+          durationUnit: freshSpec.unit,
           cost: round2(purchased.reduce((sum, leg) => sum + leg.stake, 0)),
           squeezeRatio: cfg.squeezeRatio,
           barrierOffset: freshOffset,
@@ -745,7 +791,10 @@ export default function TouchStraddlePage(props: Props): ReactElement {
           else if (result.status === "rejected") onNotice("A contract watch failed for leg " + purchased[index].side + "; settlement will fall back to the timeout check.", "bad");
         });
         armSettlementTimeout();
-        setPhase("Straddle live - tick 0 of " + freshDuration);
+        setPhase(
+          "Straddle live - " +
+            (freshSpec.unit === "t" ? "tick 0 of " + freshDuration : formatTouchDuration(freshDuration, freshSpec.unit) + " window"),
+        );
       } catch (error) {
         if (!aliveRef.current) return;
         const message = (error as Error).message || "The straddle order failed.";
@@ -789,7 +838,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
         return;
       }
       if (!cfg || !cfg.spec) {
-        onNotice("Tick ONETOUCH is not available for this market.", "bad");
+        onNotice("ONETOUCH is not available in a supported duration for this market.", "bad");
         return;
       }
       if (execRef.current || bundleRef.current || activeIdsRef.current.size > 0) {
@@ -813,7 +862,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
   const requestSingle = useCallback(() => {
     const cfg = runtimeRef.current;
     if (!connected || !cfg?.spec) {
-      onNotice("Connect and select a tick ONETOUCH market first.", "bad");
+      onNotice("Connect and select a market with supported ONETOUCH durations first.", "bad");
       return;
     }
     if (execRef.current || bundleRef.current || activeIdsRef.current.size > 0) return;
@@ -894,11 +943,16 @@ export default function TouchStraddlePage(props: Props): ReactElement {
     pricesRef.current = next;
     setPrices(next);
     const bundle = bundleRef.current;
-    if (bundle && bundle.ticksElapsed < bundle.duration && activeIdsRef.current.size > 0) {
-      const nextBundle = { ...bundle, ticksElapsed: bundle.ticksElapsed + 1 };
-      bundleRef.current = nextBundle;
-      setOpenBundle(nextBundle);
-      setPhase("Straddle live - tick " + nextBundle.ticksElapsed + " of " + nextBundle.duration);
+    if (bundle && activeIdsRef.current.size > 0) {
+      if (bundle.durationUnit === "t" && bundle.ticksElapsed < bundle.duration) {
+        const nextBundle = { ...bundle, ticksElapsed: bundle.ticksElapsed + 1 };
+        bundleRef.current = nextBundle;
+        setOpenBundle(nextBundle);
+        setPhase("Straddle live - tick " + nextBundle.ticksElapsed + " of " + nextBundle.duration);
+      } else if (bundle.durationUnit !== "t") {
+        const elapsed = Math.max(0, (Date.now() - bundle.startedAt) / 1000);
+        setPhase("Straddle live - " + formatElapsed(elapsed) + " of " + formatTouchDuration(bundle.duration, bundle.durationUnit));
+      }
     }
     maybeAutoRef.current();
   };
@@ -959,17 +1013,23 @@ export default function TouchStraddlePage(props: Props): ReactElement {
     setContractError(null);
     setOffers([]);
     void session
-      .contractsFor(symbol, currency)
+      .contractsFor(symbol)
       .then((list) => {
         if (cancelled) return;
         setOffers(list);
-        const candidate = selectOnetouchTickSpec(list, symbolPip);
+        const candidate = selectOnetouchSpec(list, symbolPip);
         if (!candidate) {
-          const touchTenors = Array.from(new Set(list.filter((offer) => offer.contractType.toUpperCase() === "ONETOUCH").map((offer) => offer.expiryType)));
+          const touch = list.filter((offer) => offer.contractType.toUpperCase() === "ONETOUCH");
+          const touchTenors = Array.from(new Set(touch.map((offer) => offer.expiryType)));
+          const touchDurations = Array.from(
+            new Set(touch.map((offer) => offer.minContractDuration + "-" + offer.maxContractDuration)),
+          ).slice(0, 6);
           setContractError(
-            touchTenors.length === 0
+            touch.length === 0
               ? symbol + " has no ONETOUCH contract in contracts_for right now."
-              : symbol + " offers ONETOUCH only for " + touchTenors.join(", ") + ", not tick expiry; this page requires tick ONETOUCH.",
+              : touchDurations.length > 0
+                ? symbol + " offers ONETOUCH only in durations this page cannot price (" + touchDurations.join(", ") + "); supported: ticks up to 15, seconds, or minutes."
+                : symbol + " offers ONETOUCH only in unsupported tenors (" + touchTenors.join(", ") + "); this page supports ticks, seconds, or minutes.",
           );
         }
       })
@@ -985,7 +1045,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
     return () => {
       cancelled = true;
     };
-  }, [accountId, connected, currency, sessionRef, symbol, symbolPip]);
+  }, [accountId, connected, sessionRef, symbol, symbolPip]);
 
   useEffect(() => {
     if (executing || cooling) {
@@ -1004,8 +1064,8 @@ export default function TouchStraddlePage(props: Props): ReactElement {
     let inFlight = false;
     const key = quoteKey;
     const requests = [
-      { symbol, contract: "ONETOUCH", barrier: upperQuery, duration: effectiveDuration, stake: cleanBase, currency },
-      { symbol, contract: "ONETOUCH", barrier: lowerQuery, duration: effectiveDuration, stake: cleanBase, currency },
+      { symbol, contract: "ONETOUCH", barrier: upperQuery, duration: effectiveDuration, durationUnit, stake: cleanBase, currency },
+      { symbol, contract: "ONETOUCH", barrier: lowerQuery, duration: effectiveDuration, durationUnit, stake: cleanBase, currency },
     ];
     const load = (quiet: boolean) => {
       if (inFlight) return;
@@ -1060,12 +1120,13 @@ export default function TouchStraddlePage(props: Props): ReactElement {
 
   const downloadCsv = useCallback(() => {
     const escape = (value: string): string => '"' + value.replace(/"/g, '""') + '"';
-    const lines = ["Timestamp,Symbol,Upper Barrier,Lower Barrier,Squeeze Ratio,Upper Leg,Lower Leg,Payout,Outcome,Profit"];
+    const lines = ["Timestamp,Symbol,Window,Upper Barrier,Lower Barrier,Squeeze Ratio,Upper Leg,Lower Leg,Payout,Outcome,Profit"];
     for (const row of rounds) {
       lines.push(
         [
           new Date(row.time).toISOString(),
           row.symbol,
+          formatTouchDurationShort(row.duration, row.durationUnit),
           row.upperBarrier,
           row.lowerBarrier,
           row.squeezeRatio.toFixed(2),
@@ -1134,8 +1195,23 @@ export default function TouchStraddlePage(props: Props): ReactElement {
         : "border-line bg-ink text-muted";
 
   const sourceMeta = spec
-    ? "Tick ONETOUCH " + spec.minTicks + "-" + spec.maxTicks + "t · default ±" + spec.defaultBarrier.toFixed(decimals) + " · pip " + pip.toFixed(decimals)
-    : "Tick ONETOUCH unavailable";
+    ? "ONETOUCH " +
+      spec.minDuration +
+      "-" +
+      spec.maxDuration +
+      durationUnitSuffix(spec.unit) +
+      " · default ±" +
+      spec.defaultBarrier.toFixed(decimals) +
+      " · pip " +
+      pip.toFixed(decimals)
+    : "ONETOUCH unavailable";
+  const openBundleSeconds = openBundle ? touchDurationToSeconds(openBundle.duration, openBundle.durationUnit) : null;
+  const openBundleElapsed = openBundle ? Math.max(0, (Date.now() - openBundle.startedAt) / 1000) : 0;
+  const openBundleProgress = openBundle
+    ? openBundle.durationUnit === "t"
+      ? openBundle.ticksElapsed / Math.max(1, openBundle.duration)
+      : openBundleElapsed / Math.max(1, openBundleSeconds ?? 1)
+    : 0;
 
   return (
     <section className="px-4 py-4 sm:px-5">
@@ -1204,12 +1280,13 @@ export default function TouchStraddlePage(props: Props): ReactElement {
           {offersLoading ? <p className="mt-2 text-[10px] text-muted">Loading contracts_for capabilities...</p> : null}
           {contractError ? (
             <div className="mt-2 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-[11px] text-danger" role="alert">
-              {contractError} Start and single-fire are disabled until Deriv offers a tick ONETOUCH contract.
+              {contractError} Start and single-fire are disabled until Deriv offers a supported ONETOUCH duration.
             </div>
           ) : null}
           {!contractError && spec ? (
             <p className="mt-2 rounded border border-accent/30 bg-accent/5 px-3 py-2 text-[10px] text-accent">
-              Dynamic contracts_for check passed. Duration is clamped to {spec.minTicks}-{spec.maxTicks} ticks; both barriers are re-priced from live proposals before every order.
+              Dynamic contracts_for check passed. Duration is clamped to {formatTouchDurationRange(spec)}; both barriers are re-priced from live proposals before every order.
+              {spec.unit !== "t" ? " This market publishes ONETOUCH in " + durationUnitLabel(spec.unit) + "; the live monitor follows the contract clock." : ""}
             </p>
           ) : null}
           {spec && spec.defaultBarrier <= 0 ? (
@@ -1280,11 +1357,11 @@ export default function TouchStraddlePage(props: Props): ReactElement {
             </p>
 
             <div className="mt-3 grid gap-2 sm:grid-cols-2">
-              <Field label={"Duration (ticks) · allowed " + (spec ? spec.minTicks + "-" + spec.maxTicks : "-")}>
+              <Field label={"Duration (" + durationUnitLabel(durationUnit) + ") · allowed " + (spec ? spec.minDuration + "-" + spec.maxDuration : "-")}>
                 <input
                   type="number"
-                  min={spec?.minTicks ?? 1}
-                  max={spec?.maxTicks ?? MAX_DURATION_TICKS}
+                  min={spec?.minDuration ?? 1}
+                  max={spec?.maxDuration ?? MAX_DURATION_TICKS}
                   step={1}
                   value={effectiveDuration}
                   disabled={buyBlocked || !spec}
@@ -1416,7 +1493,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
             </div>
             <p className="mt-2 text-[9px] leading-relaxed text-muted">
               {livePreview ? "Quotes calibrated " + new Date(livePreview.at).toLocaleTimeString() + ". " : "Waiting for two live proposals. "}
-              A single touch pays that leg's exact proposal payout; a whipsaw needs both barriers touched inside the same {effectiveDuration}-tick window. Both calls are re-priced immediately before any buy.
+              A single touch pays that leg's exact proposal payout; a whipsaw needs both barriers touched inside the same {formatTouchDurationShort(effectiveDuration, durationUnit)} window. Both calls are re-priced immediately before any buy.
             </p>
           </article>
 
@@ -1590,13 +1667,18 @@ export default function TouchStraddlePage(props: Props): ReactElement {
           <article className="rounded border border-accent/40 bg-panel p-4">
             <div className="flex flex-wrap items-start justify-between gap-2">
               <div>
-                <h2 className="text-sm font-semibold tracking-tight">Active straddle · Tick {openBundle.ticksElapsed} of {openBundle.duration}</h2>
+                <h2 className="text-sm font-semibold tracking-tight">
+                  Active straddle ·{" "}
+                  {openBundle.durationUnit === "t"
+                    ? "Tick " + openBundle.ticksElapsed + " of " + openBundle.duration
+                    : "Elapsed " + formatElapsed(openBundleElapsed) + " of " + formatTouchDuration(openBundle.duration, openBundle.durationUnit)}
+                </h2>
                 <p className="mt-0.5 text-[10px] text-muted">{openBundle.symbol} · L{openBundle.level} · {openBundle.upperBarrier} / {openBundle.lowerBarrier} · cost {openBundle.cost.toFixed(2)} {currency}</p>
               </div>
               <span className="rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[9px] font-semibold text-accent">DUAL LEGS LOCKED</span>
             </div>
             <div className="mt-2 h-2 overflow-hidden rounded-full bg-ink">
-              <div className="h-full rounded-full bg-accent transition-all" style={{ width: clamp((openBundle.ticksElapsed / Math.max(1, openBundle.duration)) * 100, 0, 100) + "%" }} />
+              <div className="h-full rounded-full bg-accent transition-all" style={{ width: clamp(openBundleProgress * 100, 0, 100) + "%" }} />
             </div>
             <div className="mt-3 grid gap-3 sm:grid-cols-2">
               {openBundle.legs.map((leg) => (
@@ -1642,7 +1724,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
                   <div className="overflow-x-auto">
                     <table className="w-full text-left text-[10px]">
                       <thead className="text-[9px] uppercase tracking-widest text-muted">
-                        <tr><th className="py-1 pr-2">Time</th><th className="py-1 pr-2">Barriers</th><th className="py-1 pr-2">L</th><th className="py-1 pr-2">Squeeze</th><th className="py-1 pr-2">Upper</th><th className="py-1 pr-2">Lower</th><th className="py-1 pr-2">Payout</th><th className="py-1 pr-2">Outcome</th><th className="py-1 pr-2">P&amp;L</th></tr>
+                        <tr><th className="py-1 pr-2">Time</th><th className="py-1 pr-2">Barriers</th><th className="py-1 pr-2">L</th><th className="py-1 pr-2">Window</th><th className="py-1 pr-2">Squeeze</th><th className="py-1 pr-2">Upper</th><th className="py-1 pr-2">Lower</th><th className="py-1 pr-2">Payout</th><th className="py-1 pr-2">Outcome</th><th className="py-1 pr-2">P&amp;L</th></tr>
                       </thead>
                       <tbody className="font-mono">
                         {groupRows.map((row) => (
@@ -1650,6 +1732,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
                             <td className="py-1 pr-2 text-muted">{new Date(row.time).toLocaleTimeString()}</td>
                             <td className="py-1 pr-2">{row.upperBarrier} / {row.lowerBarrier}</td>
                             <td className="py-1 pr-2">L{row.level}</td>
+                            <td className="py-1 pr-2">{formatTouchDurationShort(row.duration, row.durationUnit)}</td>
                             <td className="py-1 pr-2">{row.squeezeRatio.toFixed(2)}x</td>
                             <td className={"py-1 pr-2 " + (row.upperStatus === "TOUCHED" ? "text-accent" : row.upperStatus === "REJECTED" ? "text-amber-300" : "text-muted")}>{row.upperStatus}</td>
                             <td className={"py-1 pr-2 " + (row.lowerStatus === "TOUCHED" ? "text-accent" : row.lowerStatus === "REJECTED" ? "text-amber-300" : "text-muted")}>{row.lowerStatus}</td>
@@ -1678,7 +1761,7 @@ export default function TouchStraddlePage(props: Props): ReactElement {
             You are about to send {confirmMode === "auto" ? "an auto-straddle engine that can fire repeatedly" : "one simultaneous two-leg ONETOUCH order"} to the <span className="font-semibold text-danger">REAL</span> account {accountId}. Two legs are bought in one Promise.all; a single touch pays that leg, a whipsaw needs both.
           </p>
           <dl className="mt-3 grid grid-cols-2 gap-2 text-[11px]">
-            <div><dt className="text-[9px] uppercase tracking-widest text-muted">Market</dt><dd className="font-mono">{symbol} · {effectiveDuration} ticks</dd></div>
+            <div><dt className="text-[9px] uppercase tracking-widest text-muted">Market</dt><dd className="font-mono">{symbol} · {formatTouchDuration(effectiveDuration, durationUnit)}</dd></div>
             <div><dt className="text-[9px] uppercase tracking-widest text-muted">Barriers</dt><dd className="font-mono">{upperQuery} / {lowerQuery}</dd></div>
             <div><dt className="text-[9px] uppercase tracking-widest text-muted">Stake</dt><dd className="font-mono">{cleanBase.toFixed(2)} × 2 = {currentCost.toFixed(2)} {currency}</dd></div>
             <div><dt className="text-[9px] uppercase tracking-widest text-muted">SL / TP</dt><dd className="font-mono">{stopLoss.toFixed(2)} / {takeProfit.toFixed(2)}</dd></div>

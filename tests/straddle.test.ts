@@ -7,11 +7,14 @@ import {
   classifyStraddleOutcome,
   computeAtrSqueeze,
   computeStraddleRiskPlan,
+  defaultTouchDuration,
   formatSignedBarrier,
+  formatTouchDurationRange,
   isSqueezeReady,
   nextStraddleLevel,
-  parseTickContractDuration,
-  selectOnetouchTickSpec,
+  parseTouchContractDuration,
+  selectOnetouchSpec,
+  touchDurationToSeconds,
 } from "@/utils/straddleMath";
 
 function offer(patch: Partial<ContractOffer>): ContractOffer {
@@ -63,36 +66,81 @@ describe("ATR squeeze", () => {
   });
 });
 
-describe("tick ONETOUCH capability", () => {
-  it("parses tick durations and ignores minute durations", () => {
-    expect(parseTickContractDuration("5t")).toBe(5);
-    expect(parseTickContractDuration(" 10T ")).toBe(10);
-    expect(parseTickContractDuration("1m")).toBeNull();
-    expect(parseTickContractDuration("")).toBeNull();
+describe("ONETOUCH duration capability", () => {
+  it("parses tick, second, and minute durations and rejects unsupported units", () => {
+    expect(parseTouchContractDuration("5t")).toEqual({ value: 5, unit: "t" });
+    expect(parseTouchContractDuration(" 10T ")).toEqual({ value: 10, unit: "t" });
+    expect(parseTouchContractDuration("30s")).toEqual({ value: 30, unit: "s" });
+    expect(parseTouchContractDuration("2m")).toEqual({ value: 2, unit: "m" });
+    expect(parseTouchContractDuration("1h")).toBeNull();
+    expect(parseTouchContractDuration("")).toBeNull();
   });
 
-  it("selects a tick entry and exposes the default barrier", () => {
-    const spec = selectOnetouchTickSpec([offer({}), offer({ expiryType: "daily", minContractDuration: "1d", maxContractDuration: "1d", barrier: null })]);
+  it("prefers a tick entry and exposes the default barrier", () => {
+    const spec = selectOnetouchSpec([
+      offer({}),
+      offer({ expiryType: "intraday", minContractDuration: "15s", maxContractDuration: "60s" }),
+      offer({ expiryType: "daily", minContractDuration: "1d", maxContractDuration: "1d", barrier: null }),
+    ]);
     expect(spec).not.toBeNull();
-    expect(spec?.minTicks).toBe(5);
-    expect(spec?.maxTicks).toBe(10);
+    expect(spec?.unit).toBe("t");
+    expect(spec?.minDuration).toBe(5);
+    expect(spec?.maxDuration).toBe(10);
     expect(spec?.defaultBarrier).toBeCloseTo(0.14);
     expect(spec?.pipSize).toBeCloseTo(0.01);
-    expect(spec?.otherTenors).toEqual(["daily (1d-1d)"]);
+    expect(spec?.otherTenors).toEqual(["intraday (15s-60s)", "daily (1d-1d)"]);
   });
 
-  it("rejects a symbol with no tick ONETOUCH and caps duration at 15", () => {
-    expect(selectOnetouchTickSpec([offer({ expiryType: "daily" })])).toBeNull();
-    const spec = selectOnetouchTickSpec([offer({ maxContractDuration: "20t" })]);
-    expect(spec?.maxTicks).toBe(15);
+  it("rejects a symbol with no supported ONETOUCH duration and caps tick duration at 15", () => {
+    expect(selectOnetouchSpec([offer({ minContractDuration: "1d", maxContractDuration: "1d" })])).toBeNull();
+    const spec = selectOnetouchSpec([offer({ maxContractDuration: "20t" })]);
+    expect(spec?.maxDuration).toBe(15);
     expect(clampTouchDuration(30, spec)).toBe(15);
     expect(clampTouchDuration(2, spec)).toBe(5);
   });
 
   it("rejects a tick tenor whose minimum is beyond the page cap", () => {
     expect(
-      selectOnetouchTickSpec([offer({ minContractDuration: "20t", maxContractDuration: "25t" })]),
+      selectOnetouchSpec([offer({ minContractDuration: "20t", maxContractDuration: "25t" })]),
     ).toBeNull();
+  });
+
+  it("falls back to a seconds-only ONETOUCH offer", () => {
+    const spec = selectOnetouchSpec([
+      offer({ expiryType: "intraday", minContractDuration: "15s", maxContractDuration: "60s" }),
+    ]);
+    expect(spec).not.toBeNull();
+    expect(spec?.unit).toBe("s");
+    expect(spec?.minDuration).toBe(15);
+    expect(spec?.maxDuration).toBe(60);
+    expect(defaultTouchDuration(spec!)).toBe(30);
+    expect(clampTouchDuration(5, spec)).toBe(15);
+    expect(clampTouchDuration(99, spec)).toBe(60);
+    expect(formatTouchDurationRange(spec!)).toBe("15-60 seconds");
+    expect(touchDurationToSeconds(30, "s")).toBe(30);
+  });
+
+  it("normalises a seconds-minimum and minutes-maximum window", () => {
+    const spec = selectOnetouchSpec([
+      offer({ expiryType: "intraday", minContractDuration: "15s", maxContractDuration: "1m" }),
+    ]);
+    expect(spec).not.toBeNull();
+    expect(spec?.unit).toBe("s");
+    expect(spec?.minDuration).toBe(15);
+    expect(spec?.maxDuration).toBe(60);
+  });
+
+  it("falls back to a minutes-only ONETOUCH offer", () => {
+    const spec = selectOnetouchSpec([
+      offer({ expiryType: "intraday", minContractDuration: "2m", maxContractDuration: "2m" }),
+    ]);
+    expect(spec).not.toBeNull();
+    expect(spec?.unit).toBe("m");
+    expect(spec?.minDuration).toBe(2);
+    expect(spec?.maxDuration).toBe(2);
+    expect(defaultTouchDuration(spec!)).toBe(2);
+    expect(clampTouchDuration(15, spec)).toBe(2);
+    expect(touchDurationToSeconds(2, "m")).toBe(120);
   });
 });
 
