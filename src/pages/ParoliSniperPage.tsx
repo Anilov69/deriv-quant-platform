@@ -9,40 +9,70 @@ import type { SessionAdvisorMode, SessionAdvisorState } from "@/components/Sessi
 import {
   OUTCOME_LABEL,
   PAROLI_COOLDOWN_MS,
+  PAROLI_DEFAULT_CENTER,
+  PAROLI_DEFAULT_CLUSTER,
   PAROLI_DEFAULT_REINVEST_PCT,
   PAROLI_DEFAULT_STAKE,
   PAROLI_DEFAULT_THRESHOLD,
   PAROLI_FALLBACK_MULTIPLE,
+  PAROLI_MAX_CENTER,
+  PAROLI_MAX_CLUSTER,
   PAROLI_MAX_THRESHOLD,
+  PAROLI_MIN_CENTER,
+  PAROLI_MIN_CLUSTER,
   PAROLI_MIN_STAKE,
   PAROLI_MIN_THRESHOLD,
   PAROLI_SL_MULTIPLE,
   PAROLI_TP_MULTIPLE,
+  PROGRESSION_HINT,
+  PROGRESSION_LABEL,
+  PROGRESSION_MODES,
+  advanceCluster,
   advanceDrought,
-  buildParoliPlan,
+  buildModePlan,
   clamp,
+  clampCenter,
+  clampCluster,
   clampReinvestPct,
   clampStake,
   clampThreshold,
   decimalsFromPip,
   digitFromQuote,
+  emptyCluster,
   emptyDrought,
   findTrigger,
   manualTail,
+  modeAllowsThirdStep,
+  modeSteps,
+  pickStep2Trigger,
   round2,
+  seedClusters,
   seedDroughts,
-  stepStakeFor,
+  step2Requests,
+  step3Requests,
   tailLabel,
+  tailLegRequest,
   tailShort,
 } from "@/utils/paroliMath";
-import type { DroughtState, ParoliDirection, ParoliOutcome, ParoliTail, RadarDrought } from "@/utils/paroliMath";
+import type {
+  ClusterState,
+  DroughtState,
+  LegRequest,
+  ParoliDirection,
+  ParoliOutcome,
+  ParoliTail,
+  ProgressionMode,
+  RadarDrought,
+  Step2RadarCard,
+  Step2Trigger,
+} from "@/utils/paroliMath";
 
 const HZ_SYMBOLS = ["1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V"] as const;
 const JUMP_SYMBOLS = ["JD10", "JD25", "JD50", "JD75", "JD100"] as const;
 const SETTLEMENT_TIMEOUT_MS = 45000;
 const PREVIEW_REFRESH_MS = 15000;
 
-type StepResult = "WIN" | "LOSS" | "ABORT" | "-";
+type StepResult = "WIN" | "LOSS" | "PARTIAL" | "ABORT" | "-";
 type ConfirmIntent = { kind: "arm" } | { kind: "snipe"; symbol: string };
 
 interface Props {
@@ -60,7 +90,7 @@ interface Props {
   bindContractListener: (handler: ((payload: unknown) => void) | null) => void;
 }
 
-interface CardState extends DroughtState {
+interface CardState extends DroughtState, ClusterState {
   quote: number | null;
   digit: number | null;
   decimals: number;
@@ -85,10 +115,15 @@ interface BurstLeg {
   watchId: string;
   profit: number;
   status: "open" | "won" | "lost";
+  contract: LegRequest["contract"];
+  barrier: string;
+  symbol: string;
 }
 
 interface ActiveBurst {
   id: number;
+  mode: ProgressionMode;
+  radarHopping: boolean;
   symbol: string;
   tail: ParoliTail;
   triggerDrought: number;
@@ -101,14 +136,22 @@ interface ActiveBurst {
   stepStake: number;
   stepPayout: number;
   legs: BurstLeg[];
+  /** True while the house-money Step 2 waits for a cross-symbol trigger. */
+  armedStep2: boolean;
+  step2Symbol: string | null;
+  step2Kind: Step2Trigger["kind"] | null;
+  step2Metric: number;
 }
 
 interface BurstRow {
   id: number;
   time: number;
+  mode: ProgressionMode;
   symbol: string;
   tail: ParoliTail;
   triggerDrought: number;
+  step2Symbol: string | null;
+  step2Contract: string | null;
   stepResults: StepResult[];
   outcome: ParoliOutcome;
   maxRisk: number;
@@ -158,7 +201,7 @@ function Modal({ title, onClose, children }: { title: string; onClose: () => voi
 }
 
 function emptyCard(_symbol: string, _name: string, decimals: number): CardState {
-  return { ...emptyDrought(), quote: null, digit: null, decimals, ready: false, streaming: false, overAvailable: true, underAvailable: true, shared: false, error: null };
+  return { ...emptyDrought(), ...emptyCluster(), quote: null, digit: null, decimals, ready: false, streaming: false, overAvailable: true, underAvailable: true, shared: false, error: null };
 }
 
 function errorText(error: unknown): string {
@@ -195,6 +238,10 @@ function csvCell(value: string | number): string {
   return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
 }
 
+function contractLabel(contract: LegRequest["contract"], barrier: string): string {
+  return (contract === "DIGITOVER" ? "Over " : "Under ") + barrier;
+}
+
 export default function ParoliSniperPage(props: Props): ReactElement {
   const { sessionRef, connected, symbols, accounts, accountId, accountKind, balance, currency, onConnect, onAccountChange, onNotice, bindContractListener } = props;
 
@@ -211,6 +258,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
   const [steps, setSteps] = useState(2);
   const [reinvestPct, setReinvestPct] = useState(PAROLI_DEFAULT_REINVEST_PCT);
   const [direction, setDirection] = useState<ParoliDirection>("both");
+  const [progressionMode, setProgressionMode] = useState<ProgressionMode>("widening_funnel");
+  const [radarHopping, setRadarHopping] = useState(true);
+  const [clusterThreshold, setClusterThreshold] = useState(PAROLI_DEFAULT_CLUSTER);
+  const [centerThreshold, setCenterThreshold] = useState(PAROLI_DEFAULT_CENTER);
   const [pnl, setPnl] = useState(0);
   const [bursts, setBursts] = useState<BurstRow[]>([]);
   const [step1Wins, setStep1Wins] = useState(0);
@@ -238,6 +289,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
   const reinvestRef = useRef(reinvestPct);
   const thresholdRef = useRef(threshold);
   const directionRef = useRef(direction);
+  const modeRef = useRef<ProgressionMode>(progressionMode);
+  const hoppingRef = useRef(radarHopping);
+  const clusterRef = useRef(clusterThreshold);
+  const centerRef = useRef(centerThreshold);
   const multipleRef = useRef(PAROLI_FALLBACK_MULTIPLE);
   const slRef = useRef(stopLoss);
   const tpRef = useRef(takeProfit);
@@ -260,6 +315,9 @@ export default function ParoliSniperPage(props: Props): ReactElement {
   const radarGenerationRef = useRef(0);
   const cooldownTimerRef = useRef<number | undefined>(undefined);
   const scanRef = useRef<() => void>(() => undefined);
+  const step2ScanRef = useRef<() => void>(() => undefined);
+  const step2TriggerRef = useRef<((trigger: Step2Trigger | null) => void) | null>(null);
+  const buyInFlightRef = useRef(false);
   const burstSeqRef = useRef(0);
 
   useEffect(() => {
@@ -267,6 +325,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     return () => {
       aliveRef.current = false;
       if (cooldownTimerRef.current !== undefined) window.clearTimeout(cooldownTimerRef.current);
+      if (step2TriggerRef.current) {
+        step2TriggerRef.current(null);
+        step2TriggerRef.current = null;
+      }
       for (const waiter of settlementWaitersRef.current.values()) window.clearTimeout(waiter.timer);
       settlementWaitersRef.current.clear();
       seedBuffersRef.current.clear();
@@ -288,11 +350,15 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     reinvestRef.current = reinvestPct;
     thresholdRef.current = threshold;
     directionRef.current = direction;
+    modeRef.current = progressionMode;
+    hoppingRef.current = radarHopping;
+    clusterRef.current = clusterThreshold;
+    centerRef.current = centerThreshold;
     slRef.current = stopLoss;
     tpRef.current = takeProfit;
     realOkRef.current = realOk;
     currencyRef.current = currency;
-  }, [accountId, baseStake, connected, currency, direction, enabled, jumpEnabled, reinvestPct, realOk, steps, stopLoss, symbols, takeProfit, threshold]);
+  }, [accountId, baseStake, centerThreshold, clusterThreshold, connected, currency, direction, enabled, jumpEnabled, progressionMode, radarHopping, reinvestPct, realOk, steps, stopLoss, symbols, takeProfit, threshold]);
 
   const multiple = preview?.multiple ?? PAROLI_FALLBACK_MULTIPLE;
   useEffect(() => {
@@ -300,8 +366,8 @@ export default function ParoliSniperPage(props: Props): ReactElement {
   }, [multiple]);
 
   const plan = useMemo(
-    () => buildParoliPlan(baseStake, steps, reinvestPct, multiple),
-    [baseStake, multiple, reinvestPct, steps],
+    () => buildModePlan(progressionMode, baseStake, steps, reinvestPct, direction === "under" ? "under" : "over"),
+    [baseStake, direction, progressionMode, reinvestPct, steps],
   );
 
   const commitCards = useCallback((next: Record<string, CardState>) => {
@@ -388,11 +454,14 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     (current: ActiveBurst, outcome: ParoliOutcome) => {
       const net = round2(current.legs.reduce((sum, leg) => sum + leg.profit, 0));
       const stepResults: StepResult[] = ["-", "-", "-"];
-      for (const leg of current.legs) {
-        stepResults[leg.step - 1] = leg.status === "won" ? "WIN" : leg.status === "lost" ? "LOSS" : "ABORT";
+      for (let step = 1; step <= 3; step += 1) {
+        const stepLegs = current.legs.filter((leg) => leg.step === step);
+        if (stepLegs.length === 0) continue;
+        const wins = stepLegs.filter((leg) => leg.status === "won").length;
+        stepResults[step - 1] = wins === stepLegs.length ? "WIN" : wins === 0 ? "LOSS" : "PARTIAL";
       }
       if (outcome === "ROLL_ABORTED" && stepResults[current.step - 1] === "-") stepResults[current.step - 1] = "ABORT";
-      const first = current.legs[0];
+      const first = current.legs.find((leg) => leg.step === 1);
       if (first?.status === "won") {
         step1WinsRef.current += 1;
         setStep1Wins(step1WinsRef.current);
@@ -404,12 +473,16 @@ export default function ParoliSniperPage(props: Props): ReactElement {
       setPeakStep(peakStepRef.current);
       pnlRef.current = round2(pnlRef.current + net);
       setPnl(pnlRef.current);
+      const step2Legs = current.legs.filter((leg) => leg.step === 2);
       const row: BurstRow = {
         id: current.id,
         time: Date.now(),
+        mode: current.mode,
         symbol: current.symbol,
         tail: current.tail,
         triggerDrought: current.triggerDrought,
+        step2Symbol: current.step2Symbol ?? step2Legs[0]?.symbol ?? null,
+        step2Contract: step2Legs.length > 0 ? step2Legs.map((leg) => contractLabel(leg.contract, leg.barrier)).join(" + ") : null,
         stepResults,
         outcome,
         maxRisk: current.baseStake,
@@ -495,112 +568,225 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     [beginCooldown, onNotice],
   );
 
+  const waitForStep2Trigger = useCallback((): Promise<Step2Trigger | null> => {
+    return new Promise<Step2Trigger | null>((resolve) => {
+      step2TriggerRef.current = resolve;
+    });
+  }, []);
+
+  const placeStep = useCallback(
+    async (
+      base: ActiveBurst,
+      step: number,
+      symbol: string,
+      requests: LegRequest[],
+    ): Promise<{ current: ActiveBurst; won: boolean; payout: number; legStatuses: boolean[] }> => {
+      const session = sessionRef.current;
+      if (!session) throw new Error("NoSession");
+      let current = base;
+      const outlay = round2(requests.reduce((sum, request) => sum + request.stake, 0));
+      current = { ...current, step, stepStake: outlay, stepPayout: 0 };
+      burstRef.current = current;
+      setBurst(current);
+      peakStepRef.current = Math.max(peakStepRef.current, step);
+      setPeakStep(peakStepRef.current);
+      setPhase("BURST LOCKED ON " + symbol + " · STEP " + step + " OF " + current.totalSteps + " - requesting quote");
+
+      const quotes: Array<{ request: LegRequest; id: string; ask: number; payout: number }> = [];
+      for (const request of requests) {
+        const quote = await session.quote({
+          symbol,
+          contract: request.contract,
+          barrier: request.barrier,
+          duration: 1,
+          stake: request.stake,
+          currency: currencyRef.current,
+        });
+        if (!aliveRef.current) throw new Error("Unmounted");
+        quotes.push({ request, id: quote.id, ask: quote.ask, payout: round2(quote.payout) });
+      }
+      const totalPayout = round2(quotes.reduce((sum, item) => sum + item.payout, 0));
+      current = { ...current, stepPayout: totalPayout };
+      burstRef.current = current;
+      setBurst(current);
+      setPhase("BURST LOCKED ON " + symbol + " · STEP " + step + " OF " + current.totalSteps + " - buying");
+
+      buyInFlightRef.current = true;
+      // A cushion step fires both legs in one Promise.all so they enter together.
+      const contractIds = await Promise.all(quotes.map((item) => session.buy(item.id, item.ask)));
+      buyInFlightRef.current = false;
+      if (!aliveRef.current) throw new Error("Unmounted");
+
+      const pending = quotes.map((item, index) => {
+        const contractId = contractIds[index];
+        activeIdsRef.current.add(contractId);
+        const leg: BurstLeg = {
+          step,
+          stake: item.request.stake,
+          payout: item.payout,
+          contractId,
+          watchId: "",
+          profit: 0,
+          status: "open",
+          contract: item.request.contract,
+          barrier: item.request.barrier,
+          symbol,
+        };
+        current = { ...current, legs: [...current.legs, leg] };
+        return { contractId, item, settlement: waitForSettlement(contractId) };
+      });
+      burstRef.current = current;
+      setBurst(current);
+
+      // Register the waiters first so a settlement inside the watch reply cannot be missed.
+      for (const entry of pending) {
+        let watchId = "";
+        try {
+          watchId = await session.watch(entry.contractId);
+        } catch (error) {
+          cancelWait(entry.contractId);
+          throw error;
+        }
+        if (watchId) {
+          current = {
+            ...current,
+            legs: current.legs.map((leg) => (leg.contractId === entry.contractId ? { ...leg, watchId } : leg)),
+          };
+          burstRef.current = current;
+          setBurst(current);
+        }
+      }
+      if (!aliveRef.current) {
+        for (const entry of pending) {
+          const leg = current.legs.find((item) => item.contractId === entry.contractId);
+          if (leg?.watchId) void session.forget(leg.watchId);
+        }
+        throw new Error("Unmounted");
+      }
+
+      const payloads = await Promise.all(pending.map((entry) => entry.settlement));
+      if (!aliveRef.current) throw new Error("Unmounted");
+
+      const legStatuses: boolean[] = [];
+      for (let index = 0; index < pending.length; index += 1) {
+        const entry = pending[index];
+        const data = asContract(payloads[index]);
+        const rawProfit = Number(data.profit);
+        const statusText = String(data.status ?? "").toLowerCase();
+        const won = (Number.isFinite(rawProfit) && rawProfit > 0) || statusText === "won";
+        const profit =
+          Number.isFinite(rawProfit) && rawProfit !== 0
+            ? round2(rawProfit)
+            : won
+              ? round2(entry.item.payout - entry.item.request.stake)
+              : -entry.item.request.stake;
+        activeIdsRef.current.delete(entry.contractId);
+        const leg = current.legs.find((item) => item.contractId === entry.contractId);
+        if (leg?.watchId) void session.forget(leg.watchId);
+        current = {
+          ...current,
+          legs: current.legs.map((item) =>
+            item.contractId === entry.contractId ? { ...item, profit: round2(profit), status: won ? "won" : "lost" } : item,
+          ),
+        };
+        legStatuses.push(won);
+      }
+      burstRef.current = current;
+      setBurst(current);
+      return { current, won: legStatuses.every(Boolean), payout: totalPayout, legStatuses };
+    },
+    [cancelWait, sessionRef, waitForSettlement],
+  );
+
   const executeBurst = useCallback(
     async (initial: ActiveBurst): Promise<void> => {
       const session = sessionRef.current;
       if (!session) return;
       let current = initial;
-      let step = 1;
-      let buyInFlight = false;
       try {
-        while (step <= current.totalSteps) {
-          if (!aliveRef.current) return;
-          const stake = step === 1 ? current.baseStake : stepStakeFor(current.stepPayout, current.reinvestPct);
-          const contract = current.tail === "over" ? "DIGITOVER" : "DIGITUNDER";
-          const barrier = current.tail === "over" ? "6" : "3";
-          current = { ...current, step, stepStake: stake, stepPayout: 0 };
+        const step1 = await placeStep(current, 1, current.symbol, [tailLegRequest(current.tail, current.baseStake)]);
+        current = step1.current;
+        if (!aliveRef.current) return;
+        if (!step1.won) {
+          finalizeBurst(current, "STEP_1_MISS");
+          return;
+        }
+
+        let target: Step2Trigger;
+        if (current.radarHopping) {
+          current = { ...current, step: 2, armedStep2: true };
           burstRef.current = current;
           setBurst(current);
-          peakStepRef.current = Math.max(peakStepRef.current, step);
+          peakStepRef.current = Math.max(peakStepRef.current, 2);
           setPeakStep(peakStepRef.current);
-          setPhase("BURST LOCKED ON " + current.symbol + " · STEP " + step + " OF " + current.totalSteps + " - requesting quote");
-
-          const quote = await session.quote({
-            symbol: current.symbol,
-            contract,
-            barrier,
-            duration: 1,
-            stake,
-            currency: currencyRef.current,
-          });
+          setPhase("HOUSE MONEY ARMED: $" + current.stepPayout.toFixed(2) + " READY FOR STEP 2 · SCANNING ACTIVE FEEDS...");
+          const triggered = await waitForStep2Trigger();
           if (!aliveRef.current) return;
-          current = { ...current, stepPayout: round2(quote.payout) };
-          burstRef.current = current;
-          setBurst(current);
-          setPhase("BURST LOCKED ON " + current.symbol + " · STEP " + step + " OF " + current.totalSteps + " - buying");
-
-          buyInFlight = true;
-          const contractId = await session.buy(quote.id, quote.ask);
-          buyInFlight = false;
-          if (!aliveRef.current) return;
-          activeIdsRef.current.add(contractId);
-          const leg: BurstLeg = {
-            step,
-            stake,
-            payout: round2(quote.payout),
-            contractId,
-            watchId: "",
-            profit: 0,
-            status: "open",
-          };
-          current = { ...current, legs: [...current.legs, leg] };
-          burstRef.current = current;
-          setBurst(current);
-
-          // Register first so a settlement in the watch reply cannot be missed.
-          const settlement = waitForSettlement(contractId);
-          let watchId = "";
-          try {
-            watchId = await session.watch(contractId);
-          } catch (error) {
-            cancelWait(contractId);
-            throw error;
-          }
-          if (watchId) {
-            current = { ...current, legs: current.legs.map((item) => (item.contractId === contractId ? { ...item, watchId } : item)) };
-            burstRef.current = current;
-            setBurst(current);
-          }
-          if (!aliveRef.current) {
-            if (watchId) void session.forget(watchId);
+          if (!triggered) {
+            // Stop pressed while armed: bank the Step-1 profit and go idle.
+            finalizeBurst(current, "ROLL_ABORTED");
             return;
           }
-          const payload = await settlement;
-          if (!aliveRef.current) return;
-          const data = asContract(payload);
-          const rawProfit = Number(data.profit);
-          const statusText = String(data.status ?? "").toLowerCase();
-          const won = (Number.isFinite(rawProfit) && rawProfit > 0) || statusText === "won";
-          const profit = Number.isFinite(rawProfit) && rawProfit !== 0 ? round2(rawProfit) : won ? round2(quote.payout - stake) : -stake;
-          activeIdsRef.current.delete(contractId);
-          if (watchId) void session.forget(watchId);
+          target = triggered;
           current = {
             ...current,
-            legs: current.legs.map((item) => (item.contractId === contractId ? { ...item, profit: round2(profit), status: won ? "won" : "lost" } : item)),
+            armedStep2: false,
+            step2Symbol: target.symbol,
+            step2Kind: target.kind,
+            step2Metric: target.metric,
           };
-          burstRef.current = current;
-          setBurst(current);
-          if (!won) {
-            const outcome: ParoliOutcome = step === 1 ? "STEP_1_MISS" : step === 2 ? "STEP_2_BREAK" : "STEP_3_BREAK";
-            finalizeBurst(current, outcome);
-            return;
-          }
-          if (step === current.totalSteps) {
-            finalizeBurst(current, "PAROLI_JACKPOT");
-            return;
-          }
-          step += 1;
+        } else {
+          const kind: Step2Trigger["kind"] = current.mode === "paroli_cushion" ? "cushion" : current.tail;
+          target = { symbol: current.symbol, kind, metric: 0 };
+          current = { ...current, step: 2, step2Symbol: current.symbol, step2Kind: kind };
         }
+        burstRef.current = current;
+        setBurst(current);
+
+        const step2Tail: ParoliTail = target.kind === "under" ? "under" : "over";
+        const step2 = await placeStep(
+          current,
+          2,
+          target.symbol,
+          step2Requests(current.mode, step2Tail, current.stepPayout, current.baseStake, current.reinvestPct),
+        );
+        current = step2.current;
+        if (!aliveRef.current) return;
+
+        if (current.mode === "paroli_cushion") {
+          finalizeBurst(current, step2.legStatuses.every(Boolean) ? "CUSHION_DOUBLE_JACKPOT" : "CUSHION_LOCK_WIN");
+          return;
+        }
+        if (!step2.won) {
+          finalizeBurst(current, current.mode === "parachute_skim" ? "PARACHUTE_BREAK_EVEN" : "STEP_2_BREAK");
+          return;
+        }
+        if (current.totalSteps >= 3) {
+          const step3 = await placeStep(
+            current,
+            3,
+            target.symbol,
+            step3Requests(current.mode, step2Tail, step2.payout, current.reinvestPct),
+          );
+          current = step3.current;
+          if (!aliveRef.current) return;
+          finalizeBurst(current, step3.won ? "STEP3_MEGA_JACKPOT" : "STEP_3_BREAK");
+          return;
+        }
+        finalizeBurst(current, "PAROLI_JACKPOT");
       } catch (error) {
         if (!aliveRef.current) return;
+        const latest = burstRef.current ?? current;
         const errorCode = error instanceof DerivError ? error.code : "";
-        if (buyInFlight && (!(error instanceof DerivError) || errorCode === "Timeout" || errorCode === "Socket")) {
+        if (buyInFlightRef.current && (!(error instanceof DerivError) || errorCode === "Timeout" || errorCode === "Socket")) {
+          buyInFlightRef.current = false;
           armedRef.current = false;
           setArmed(false);
           setPhase("Buy acknowledgement missing - radar locked; verify the contract in Deriv before reloading");
           onNotice("The buy request did not return a contract id (" + errorText(error) + "). The radar lock is held; verify the contract in Deriv and reload after it settles.", "bad");
           return;
         }
+        buyInFlightRef.current = false;
         if (activeIdsRef.current.size > 0) {
           armedRef.current = false;
           setArmed(false);
@@ -611,23 +797,23 @@ export default function ParoliSniperPage(props: Props): ReactElement {
           );
           return;
         }
-        if (current.legs.some((leg) => leg.status === "won")) {
+        if (latest.legs.some((leg) => leg.status === "won")) {
           onNotice("The next roll could not be placed: " + errorText(error) + ". The completed step was preserved.", "bad");
-          finalizeBurst(current, "ROLL_ABORTED");
+          finalizeBurst(latest, "ROLL_ABORTED");
         } else {
           releaseAborted("Burst was not placed: " + errorText(error));
         }
       }
     },
-    [cancelWait, finalizeBurst, onNotice, releaseAborted, sessionRef, waitForSettlement],
+    [cancelWait, finalizeBurst, onNotice, placeStep, releaseAborted, sessionRef, waitForStep2Trigger],
   );
 
   const fireBurst = useCallback(
-    (mode: "auto" | "manual", symbol: string, tail: ParoliTail, triggerDrought: number) => {
+    (activation: "auto" | "manual", symbol: string, tail: ParoliTail, triggerDrought: number) => {
       const session = sessionRef.current;
       if (!session || !connectedRef.current) { onConnect(); return; }
       if (!aliveRef.current || execRef.current || coolingRef.current || burstRef.current || activeIdsRef.current.size > 0) return;
-      if (mode === "auto" && !armedRef.current) return;
+      if (activation === "auto" && !armedRef.current) return;
       const card = cardsRef.current[symbol];
       if (!card || !card.ready || !card.streaming) return;
       if (tail === "over" && !card.overAvailable) return;
@@ -642,12 +828,15 @@ export default function ParoliSniperPage(props: Props): ReactElement {
         showAdvisor(step1WinsRef.current > 0 ? "SL_PARTIAL_WINS" : "SL_ZERO_WINS", base);
         return;
       }
+      const progression = modeRef.current;
       const current: ActiveBurst = {
         id: ++burstSeqRef.current,
+        mode: progression,
+        radarHopping: hoppingRef.current,
         symbol,
         tail,
         triggerDrought,
-        totalSteps: stepsRef.current,
+        totalSteps: modeSteps(progression, stepsRef.current),
         reinvestPct: reinvestRef.current,
         baseStake: base,
         multiple: multipleRef.current,
@@ -656,6 +845,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
         stepStake: base,
         stepPayout: 0,
         legs: [],
+        armedStep2: false,
+        step2Symbol: null,
+        step2Kind: null,
+        step2Metric: 0,
       };
       burstRef.current = current;
       execRef.current = true;
@@ -694,6 +887,75 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     scanRef.current = scanForTrigger;
   }, [scanForTrigger]);
 
+  const buildStep2Cards = useCallback((): Step2RadarCard[] => {
+    const pool: Step2RadarCard[] = [];
+    let order = 0;
+    for (const symbol of enabledRef.current) {
+      const card = cardsRef.current[symbol];
+      if (!card || !card.ready || !card.streaming) continue;
+      pool.push({
+        symbol,
+        enabled: true,
+        ready: true,
+        order: order++,
+        lowStreak: card.lowStreak,
+        highStreak: card.highStreak,
+        centerDrought: card.centerDrought,
+        high: card.high,
+        low: card.low,
+      });
+    }
+    return pool;
+  }, []);
+
+  const scanForStep2 = useCallback(() => {
+    const resolve = step2TriggerRef.current;
+    const current = burstRef.current;
+    if (!resolve || !current || !current.armedStep2) return;
+    if (!aliveRef.current || !connectedRef.current) return;
+    const trigger = pickStep2Trigger(buildStep2Cards(), current.mode, {
+      clusterThreshold: clusterRef.current,
+      centerThreshold: centerRef.current,
+      droughtThreshold: thresholdRef.current,
+      direction: directionRef.current,
+    });
+    if (!trigger) return;
+    step2TriggerRef.current = null;
+    resolve(trigger);
+  }, [buildStep2Cards]);
+
+  useEffect(() => {
+    step2ScanRef.current = scanForStep2;
+  }, [scanForStep2]);
+
+  const fireStep2Now = useCallback(() => {
+    const resolve = step2TriggerRef.current;
+    const current = burstRef.current;
+    if (!resolve || !current || !current.armedStep2) return;
+    const trigger = pickStep2Trigger(buildStep2Cards(), current.mode, {
+      clusterThreshold: clusterRef.current,
+      centerThreshold: centerRef.current,
+      droughtThreshold: thresholdRef.current,
+      direction: directionRef.current,
+      requireThreshold: false,
+    });
+    if (!trigger) {
+      onNotice("No live feed is ready for Step 2 yet - keep scanning.", "bad");
+      return;
+    }
+    step2TriggerRef.current = null;
+    resolve(trigger);
+  }, [buildStep2Cards, onNotice]);
+
+  const abortStep2 = useCallback(() => {
+    const resolve = step2TriggerRef.current;
+    const current = burstRef.current;
+    if (!current || !current.armedStep2) return;
+    step2TriggerRef.current = null;
+    if (resolve) resolve(null);
+    setPhase("Step 2 cancelled - banked house money preserved");
+  }, []);
+
   const handleTick = useCallback(
     (symbol: string, tick: Tick) => {
       if (!enabledRef.current.has(symbol) || !Number.isFinite(tick.quote) || tick.quote <= 0) return;
@@ -709,9 +971,11 @@ export default function ParoliSniperPage(props: Props): ReactElement {
       }
       const current = existing ?? emptyCard(symbol, info?.name ?? symbol, decimals);
       const advanced = advanceDrought(current, digit);
-      const next: CardState = { ...current, ...advanced, quote: tick.quote, digit, decimals, ready: true, streaming: true, error: null };
+      const cluster = advanceCluster(current, digit);
+      const next: CardState = { ...current, ...advanced, ...cluster, quote: tick.quote, digit, decimals, ready: true, streaming: true, error: null };
       commitCards({ ...cardsRef.current, [symbol]: next });
       scanRef.current();
+      step2ScanRef.current();
     },
     [commitCards],
   );
@@ -775,15 +1039,17 @@ export default function ParoliSniperPage(props: Props): ReactElement {
         if (seedError) {
           next = { ...live, error: seedError || live.error };
           for (const tick of bufferedTicks) {
-            next = { ...next, ...advanceDrought(next, tick.digit), quote: tick.quote, digit: tick.digit, decimals, ready: true };
+            next = { ...next, ...advanceDrought(next, tick.digit), ...advanceCluster(next, tick.digit), quote: tick.quote, digit: tick.digit, decimals, ready: true };
           }
         } else {
           const quotes = historyTicks.map((tick) => tick.quote);
           const seed = seedDroughts(quotes, decimals);
+          const cluster = seedClusters(quotes, decimals);
           const lastQuote = historyTicks.length > 0 ? historyTicks[historyTicks.length - 1].quote : null;
           next = {
             ...live,
             ...seed,
+            ...cluster,
             quote: lastQuote,
             digit: lastQuote === null ? null : digitFromQuote(lastQuote, decimals),
             decimals,
@@ -794,7 +1060,7 @@ export default function ParoliSniperPage(props: Props): ReactElement {
           const lastEpoch = historyTicks.length > 0 ? historyTicks[historyTicks.length - 1].epoch : 0;
           for (const tick of bufferedTicks) {
             if (lastEpoch > 0 && tick.epoch > 0 && tick.epoch <= lastEpoch) continue;
-            next = { ...next, ...advanceDrought(next, tick.digit), quote: tick.quote, digit: tick.digit, decimals, ready: true };
+            next = { ...next, ...advanceDrought(next, tick.digit), ...advanceCluster(next, tick.digit), quote: tick.quote, digit: tick.digit, decimals, ready: true };
           }
         }
         commitCards({ ...cardsRef.current, [symbol]: next });
@@ -892,6 +1158,7 @@ export default function ParoliSniperPage(props: Props): ReactElement {
   const requestArm = useCallback(
     () => {
       if (!connectedRef.current) { onConnect(); return; }
+      if (burstRef.current?.armedStep2) { abortStep2(); return; }
       if (armedRef.current) { stopEngine("Sniper paused - radar still scanning visually"); return; }
       if (execRef.current || burstRef.current) return;
       if (accountKind !== "demo" && !realOkRef.current) {
@@ -901,7 +1168,7 @@ export default function ParoliSniperPage(props: Props): ReactElement {
       }
       armEngine();
     },
-    [accountKind, armEngine, onConnect, stopEngine],
+    [abortStep2, accountKind, armEngine, onConnect, stopEngine],
   );
 
   const snipeNow = useCallback(
@@ -968,6 +1235,15 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     [stopEngine],
   );
 
+  const applyMode = useCallback((mode: ProgressionMode) => {
+    modeRef.current = mode;
+    setProgressionMode(mode);
+    if (!modeAllowsThirdStep(mode) && stepsRef.current !== 2) {
+      stepsRef.current = 2;
+      setSteps(2);
+    }
+  }, []);
+
   const enabledKey = useMemo(() => Array.from(enabled).sort().join("|"), [enabled]);
   const visibleSymbols = useMemo<string[]>(() => (jumpEnabled ? [...HZ_SYMBOLS, ...JUMP_SYMBOLS] : [...HZ_SYMBOLS]), [jumpEnabled]);
 
@@ -986,6 +1262,9 @@ export default function ParoliSniperPage(props: Props): ReactElement {
           decimals,
           high: state?.high ?? 0,
           low: state?.low ?? 0,
+          lowStreak: state?.lowStreak ?? 0,
+          highStreak: state?.highStreak ?? 0,
+          centerDrought: state?.centerDrought ?? 0,
           ready: Boolean(state?.ready && state.streaming),
           overAvailable: state?.overAvailable ?? true,
           underAvailable: state?.underAvailable ?? true,
@@ -1068,6 +1347,12 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     if (connected) return;
     setConfirmIntent(null);
     setConfirmChecked(false);
+    if (burstRef.current?.armedStep2) {
+      const resolve = step2TriggerRef.current;
+      step2TriggerRef.current = null;
+      if (resolve) resolve(null);
+      return;
+    }
     if (burstRef.current || activeIdsRef.current.size > 0) {
       setPhase("Connection lost during burst - settlement lock held");
       return;
@@ -1091,7 +1376,7 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     const next = plan.autoTakeProfit;
     tpRef.current = next;
     setTakeProfit(next);
-  }, [isTpManual, plan.autoTakeProfit]);
+  }, [isTpManual, plan.autoTakeProfit, progressionMode, baseStake, reinvestPct, steps]);
 
   useEffect(() => {
     if (!connected) return;
@@ -1149,7 +1434,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
   const downloadCsv = useCallback(() => {
     const header = [
       "Timestamp",
+      "Mode",
       "Symbol",
+      "Step 2 Symbol",
+      "Step 2 Contract",
       "Tail",
       "Trigger Drought",
       "Step 1 Result",
@@ -1161,7 +1449,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
     ];
     const rows = bursts.map((row) => [
       new Date(row.time).toISOString(),
+      PROGRESSION_LABEL[row.mode],
       row.symbol,
+      row.step2Symbol ?? "",
+      row.step2Contract ?? "",
       tailShort(row.tail),
       row.triggerDrought,
       row.stepResults[0] ?? "-",
@@ -1250,12 +1541,49 @@ export default function ParoliSniperPage(props: Props): ReactElement {
 
         <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_350px]">
           <div className="space-y-3">
+            {burst?.armedStep2 ? (
+              <div className="rounded-lg border border-emerald-400/60 bg-emerald-400/15 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="text-[10px] font-bold uppercase tracking-widest text-emerald-200">House money armed</p>
+                    <p className="mt-0.5 font-mono text-sm font-semibold text-emerald-100">
+                      ${burst.stepPayout.toFixed(2)} READY FOR STEP 2 · SCANNING ACTIVE FEEDS...
+                    </p>
+                    <p className="mt-0.5 text-[9px] text-emerald-200/80">
+                      {progressionMode === "paroli_cushion"
+                        ? "Waiting for " + centerThreshold + " ticks without a 4 or 5 on any armed feed"
+                        : progressionMode === "classic_tail"
+                          ? "Waiting for an " + threshold + "-tick tail drought on any armed feed"
+                          : "Waiting for " + clusterThreshold + " consecutive low (0-4) or high (5-9) ticks"}
+                    </p>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={fireStep2Now}
+                      className="rounded border border-emerald-300 bg-emerald-400 px-3 py-1.5 text-[11px] font-bold text-ink hover:bg-emerald-300"
+                    >
+                      Fire Step 2 Now
+                    </button>
+                    <button
+                      type="button"
+                      onClick={abortStep2}
+                      className="rounded border border-emerald-400/50 px-3 py-1.5 text-[11px] font-semibold text-emerald-100 hover:bg-emerald-400/10"
+                    >
+                      Stop · bank it
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <MultiSymbolRadarGrid
               cards={cardsView}
               threshold={threshold}
               burst={burstView}
               busy={busy}
               snipeDisabled={snipeDisabled}
+              step2={{ hopping: radarHopping, mode: progressionMode, clusterThreshold, centerThreshold, armed: Boolean(burst?.armedStep2) }}
               onToggle={toggleSymbol}
               onSnipe={requestSnipe}
             />
@@ -1272,7 +1600,15 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                   {multiple.toFixed(2)}x · {sourceLabel}
                 </span>
               </div>
-              <div className="mt-3 grid gap-2 sm:grid-cols-3">
+              <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                <span className="rounded-full border border-emerald-400/40 bg-emerald-400/10 px-2 py-0.5 text-[9px] font-semibold text-emerald-300">
+                  {PROGRESSION_LABEL[progressionMode]}
+                </span>
+                <span className="rounded-full border border-line px-2 py-0.5 text-[9px] text-muted">
+                  {plan.totalSteps} steps · {direction === "under" ? "Under path" : "Over path"}
+                </span>
+              </div>
+              <div className="mt-2 grid gap-2 sm:grid-cols-3">
                 {plan.steps.map((step) => (
                   <div key={step.step} className={"rounded border p-2.5 " + (step.step === 1 ? "border-sky-400/40 bg-sky-400/5" : "border-emerald-400/30 bg-emerald-400/5")}>
                     <div className="flex items-center justify-between gap-2">
@@ -1282,17 +1618,23 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                       </span>
                     </div>
                     <div className="mt-2 font-mono text-lg text-slate-100">${step.stake.toFixed(2)}</div>
-                    <div className="mt-0.5 text-[10px] text-muted">stake → est. <span className="font-mono text-slate-300">${step.payout.toFixed(2)}</span></div>
+                    <div className="mt-1 space-y-0.5">
+                      {step.legs.map((leg, index) => (
+                        <p key={index} className="font-mono text-[9px] text-slate-300">
+                          {leg.label} · ${leg.stake.toFixed(2)} → ${leg.payout.toFixed(2)}
+                        </p>
+                      ))}
+                    </div>
                     <div className="mt-1 font-mono text-[10px] text-emerald-300">+${step.profit.toFixed(2)} if this step wins</div>
                   </div>
                 ))}
               </div>
               <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
                 {[
-                  ["Final jackpot payout", "$" + plan.finalPayout.toFixed(2)],
+                  ["Step 2 if it misses", plan.step2MissLabel],
                   ["Net burst profit", "+$" + plan.netProfit.toFixed(2)],
+                  ["ROI on base stake", "+" + plan.roiPct.toFixed(0) + "%"],
                   ["Max cash risk", "$" + plan.maxRisk.toFixed(2)],
-                  ["Breakeven", plan.breakevenMisses.toFixed(1) + " Step-1 misses"],
                 ].map(([label, value]) => (
                   <div key={label} className="rounded border border-line bg-ink/50 px-2 py-1.5">
                     <p className="text-[8px] uppercase tracking-widest text-muted">{label}</p>
@@ -1301,8 +1643,8 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                 ))}
               </div>
               <p className="mt-2 text-[10px] leading-relaxed text-muted">
-                The live proposal multiple is advisory and only updates this preview. Every actual stake and payout is re-quoted immediately
-                before purchase. A 100% reinvestment can only give back the base stake after a prior win; at 75% the give-back is smaller.
+                The ladder projects fixed payout multiples; the live proposal ({multiple.toFixed(2)}x) is advisory only and every stake is re-quoted
+                immediately before purchase. The Step-2 miss row is the exact burst result if Step 2 loses.
               </p>
             </section>
           </div>
@@ -1359,6 +1701,23 @@ export default function ParoliSniperPage(props: Props): ReactElement {
             <section className="rounded-lg border border-line bg-panel p-3">
               <h2 className="text-sm font-semibold tracking-tight">Burst configuration</h2>
               <div className="mt-3">
+                <p className="text-[9px] uppercase tracking-widest text-muted">Progression mode</p>
+                <div className="mt-1 grid grid-cols-2 gap-1 rounded border border-line bg-ink/60 p-1">
+                  {PROGRESSION_MODES.map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => applyMode(mode)}
+                      disabled={busy}
+                      className={"rounded px-1 py-1.5 text-[10px] font-semibold disabled:opacity-50 " + (progressionMode === mode ? "bg-accent text-ink" : "text-muted hover:text-slate-100")}
+                    >
+                      {PROGRESSION_LABEL[mode]}
+                    </button>
+                  ))}
+                </div>
+                <p className="mt-1 text-[9px] leading-relaxed text-muted">{PROGRESSION_HINT[progressionMode]}</p>
+              </div>
+              <div className="mt-2">
                 <p className="text-[9px] uppercase tracking-widest text-muted">Direction</p>
                 <div className="mt-1 grid grid-cols-3 gap-1 rounded border border-line bg-ink/60 p-1">
                   {(["both", "over", "under"] as const).map((value) => (
@@ -1399,6 +1758,55 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                   />
                 </Field>
               </div>
+
+              <div className="mt-3 rounded border border-line bg-ink/50 p-2">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-[10px] font-semibold text-slate-200">Step-2 radar hopping</p>
+                    <p className="text-[9px] text-muted">Arm house money and scan all active feeds.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { hoppingRef.current = !radarHopping; setRadarHopping(hoppingRef.current); }}
+                    disabled={busy}
+                    className={"rounded border px-2.5 py-1 text-[10px] font-semibold disabled:opacity-40 " + (radarHopping ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-300" : "border-line bg-ink text-muted")}
+                  >
+                    {radarHopping ? "Radar ON" : "Radar OFF"}
+                  </button>
+                </div>
+                {radarHopping ? (
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    {progressionMode !== "paroli_cushion" ? (
+                      <Field label="Cluster threshold (ticks)">
+                        <input
+                          type="number"
+                          min={PAROLI_MIN_CLUSTER}
+                          max={PAROLI_MAX_CLUSTER}
+                          step={1}
+                          value={clusterThreshold}
+                          disabled={busy}
+                          onChange={(event) => { const next = clampCluster(Number(event.target.value)); clusterRef.current = next; setClusterThreshold(next); }}
+                          className={inputClass}
+                        />
+                      </Field>
+                    ) : null}
+                    {progressionMode === "paroli_cushion" ? (
+                      <Field label="Center drought threshold">
+                        <input
+                          type="number"
+                          min={PAROLI_MIN_CENTER}
+                          max={PAROLI_MAX_CENTER}
+                          step={1}
+                          value={centerThreshold}
+                          disabled={busy}
+                          onChange={(event) => { const next = clampCenter(Number(event.target.value)); centerRef.current = next; setCenterThreshold(next); }}
+                          className={inputClass}
+                        />
+                      </Field>
+                    ) : null}
+                  </div>
+                ) : null}
+              </div>
               <div className="mt-2">
                 <p className="text-[9px] uppercase tracking-widest text-muted">Paroli depth</p>
                 <div className="mt-1 grid grid-cols-2 gap-1 rounded border border-line bg-ink/60 p-1">
@@ -1413,12 +1821,19 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                   <button
                     type="button"
                     onClick={() => { stepsRef.current = 3; setSteps(3); }}
-                    disabled={busy}
+                    disabled={busy || !modeAllowsThirdStep(progressionMode)}
                     className={"rounded px-2 py-1.5 text-[10px] font-semibold disabled:opacity-50 " + (steps === 3 ? "bg-accent text-ink" : "text-muted hover:text-slate-100")}
                   >
                     3-step house money
                   </button>
                 </div>
+                {!modeAllowsThirdStep(progressionMode) ? (
+                  <p className="mt-1 text-[9px] leading-relaxed text-muted">
+                    {progressionMode === "paroli_cushion"
+                      ? "Completes in 2 steps with the guaranteed Step-2 cushion lock."
+                      : "Completes in 2 steps; Step 2 only risks banked profit."}
+                  </p>
+                ) : null}
               </div>
               <div className="mt-2">
                 <div className="flex items-center justify-between text-[9px] uppercase tracking-widest text-muted">
@@ -1555,6 +1970,9 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                 <thead className="text-[9px] uppercase tracking-widest text-muted">
                   <tr className="border-b border-line">
                     <th className="py-1.5 pr-2 font-medium">Time</th>
+                    <th className="py-1.5 pr-2 font-medium">Mode</th>
+                    <th className="py-1.5 pr-2 font-medium">Step 2 Symbol</th>
+                    <th className="py-1.5 pr-2 font-medium">Step 2 Contract</th>
                     <th className="py-1.5 pr-2 font-medium">Symbol</th>
                     <th className="py-1.5 pr-2 font-medium">Tail</th>
                     <th className="py-1.5 pr-2 font-medium">Trigger</th>
@@ -1568,6 +1986,9 @@ export default function ParoliSniperPage(props: Props): ReactElement {
                   {bursts.map((row) => (
                     <tr key={row.id} className="border-b border-line/60 last:border-0">
                       <td className="py-1.5 pr-2 font-mono text-[10px] text-muted">{new Date(row.time).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</td>
+                      <td className="py-1.5 pr-2 text-[9px] font-semibold text-slate-300">{PROGRESSION_LABEL[row.mode]}</td>
+                      <td className="py-1.5 pr-2 font-mono text-slate-200">{row.step2Symbol ?? "-"}</td>
+                      <td className="py-1.5 pr-2 text-[9px] text-slate-300">{row.step2Contract ?? "-"}</td>
                       <td className="py-1.5 pr-2 font-mono text-slate-200">{row.symbol}</td>
                       <td className="py-1.5 pr-2 text-slate-300">{tailLabel(row.tail)}</td>
                       <td className="py-1.5 pr-2 font-mono text-slate-300">{row.triggerDrought} ticks</td>

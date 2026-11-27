@@ -10,6 +10,10 @@ export type ParoliTail = "over" | "under";
 export type ParoliDirection = "both" | "over" | "under";
 export type ParoliOutcome =
   | "PAROLI_JACKPOT"
+  | "STEP3_MEGA_JACKPOT"
+  | "CUSHION_DOUBLE_JACKPOT"
+  | "CUSHION_LOCK_WIN"
+  | "PARACHUTE_BREAK_EVEN"
   | "STEP_2_BREAK"
   | "STEP_3_BREAK"
   | "STEP_1_MISS"
@@ -263,6 +267,10 @@ export function buildParoliPlan(
 
 export const OUTCOME_LABEL: Record<ParoliOutcome, string> = {
   PAROLI_JACKPOT: "PAROLI JACKPOT",
+  STEP3_MEGA_JACKPOT: "3-STEP MEGA JACKPOT",
+  CUSHION_DOUBLE_JACKPOT: "CUSHION DOUBLE JACKPOT",
+  CUSHION_LOCK_WIN: "CUSHION LOCK WIN",
+  PARACHUTE_BREAK_EVEN: "PARACHUTE BREAK-EVEN",
   STEP_2_BREAK: "STEP 2 BREAK",
   STEP_3_BREAK: "STEP 3 BREAK",
   STEP_1_MISS: "STEP 1 MISS",
@@ -271,4 +279,331 @@ export const OUTCOME_LABEL: Record<ParoliOutcome, string> = {
 
 export function isBreakOutcome(outcome: ParoliOutcome): boolean {
   return outcome === "STEP_2_BREAK" || outcome === "STEP_3_BREAK" || outcome === "STEP_1_MISS";
+}
+
+/* ------------------------------------------------------------------ */
+/* Progression modes, contract ladders and step-2 radar hopping        */
+/* ------------------------------------------------------------------ */
+
+export type ProgressionMode = "widening_funnel" | "paroli_cushion" | "classic_tail" | "parachute_skim";
+export type DigitContract = "DIGITOVER" | "DIGITUNDER";
+
+export const PROGRESSION_MODES: readonly ProgressionMode[] = [
+  "widening_funnel",
+  "paroli_cushion",
+  "classic_tail",
+  "parachute_skim",
+];
+
+export const PROGRESSION_LABEL: Record<ProgressionMode, string> = {
+  widening_funnel: "Widening Funnel",
+  paroli_cushion: "Paroli x Cushion",
+  classic_tail: "Classic Tail Sniper",
+  parachute_skim: "Parachute Skim",
+};
+
+export const PROGRESSION_HINT: Record<ProgressionMode, string> = {
+  widening_funnel: "30% -> 50%: Step 2 widens to a half-board single contract.",
+  paroli_cushion: "100% guaranteed after Step 1: simultaneous Over 3 + Under 6 lock.",
+  classic_tail: "30% -> 30%: every step repeats Over 6 or Under 3.",
+  parachute_skim: "Zero-risk Step 2: only the banked profit is staked.",
+};
+
+/** Indicative payouts: three-digit tail, half board, and the six-digit cushion legs. */
+export const PAROLI_TAIL_MULTIPLE = 2.92;
+export const PAROLI_HALF_MULTIPLE = 1.95;
+export const PAROLI_CUSHION_MULTIPLE = 1.51;
+
+export const PAROLI_DEFAULT_CLUSTER = 4;
+export const PAROLI_MIN_CLUSTER = 2;
+export const PAROLI_MAX_CLUSTER = 12;
+export const PAROLI_DEFAULT_CENTER = 6;
+export const PAROLI_MIN_CENTER = 3;
+export const PAROLI_MAX_CENTER = 15;
+export const PAROLI_AUTO_TP_FLOOR = 1;
+
+export function clampCluster(value: number): number {
+  return Math.round(clamp(value, PAROLI_MIN_CLUSTER, PAROLI_MAX_CLUSTER));
+}
+
+export function clampCenter(value: number): number {
+  return Math.round(clamp(value, PAROLI_MIN_CENTER, PAROLI_MAX_CENTER));
+}
+
+export function modeSteps(mode: ProgressionMode, steps: number): number {
+  if (mode === "paroli_cushion" || mode === "parachute_skim") return 2;
+  return clampSteps(steps);
+}
+
+export function modeAllowsThirdStep(mode: ProgressionMode): boolean {
+  return mode === "widening_funnel" || mode === "classic_tail";
+}
+
+/** Consecutive cluster counters used by the Step-2 radar scan. */
+export interface ClusterState {
+  /** Consecutive digits in 0-4 (feeds Over 4). */
+  lowStreak: number;
+  /** Consecutive digits in 5-9 (feeds Under 5). */
+  highStreak: number;
+  /** Consecutive ticks without a 4 or a 5 (feeds the cushion lock). */
+  centerDrought: number;
+}
+
+export function emptyCluster(): ClusterState {
+  return { lowStreak: 0, highStreak: 0, centerDrought: 0 };
+}
+
+export function advanceCluster(previous: ClusterState, digit: number | null): ClusterState {
+  if (digit === null) return previous;
+  return {
+    lowStreak: digit <= 4 ? previous.lowStreak + 1 : 0,
+    highStreak: digit >= 5 ? previous.highStreak + 1 : 0,
+    centerDrought: digit === 4 || digit === 5 ? 0 : previous.centerDrought + 1,
+  };
+}
+
+export function seedClusters(quotes: readonly number[], decimals: number): ClusterState {
+  let state = emptyCluster();
+  for (const quote of quotes) {
+    const digit = digitFromQuote(quote, decimals);
+    if (digit !== null) state = advanceCluster(state, digit);
+  }
+  return state;
+}
+
+export interface LegRequest {
+  contract: DigitContract;
+  barrier: string;
+  stake: number;
+  label: string;
+}
+
+export interface ModeLeg extends LegRequest {
+  payout: number;
+}
+
+export interface ModeStep {
+  step: number;
+  legs: ModeLeg[];
+  stake: number;
+  payout: number;
+  profit: number;
+  cumulativeStake: number;
+  cumulativePayout: number;
+}
+
+export interface ModePlan {
+  mode: ProgressionMode;
+  baseStake: number;
+  steps: ModeStep[];
+  totalSteps: number;
+  netProfit: number;
+  /** Cushion only: the floor that one surviving leg guarantees. */
+  guaranteedNet: number;
+  maxRisk: number;
+  step2MissPnL: number;
+  step2MissLabel: string;
+  roiPct: number;
+  autoStopLoss: number;
+  autoTakeProfit: number;
+}
+
+export function legMultiple(contract: DigitContract, barrier: string): number {
+  if (contract === "DIGITOVER" && barrier === "6") return PAROLI_TAIL_MULTIPLE;
+  if (contract === "DIGITUNDER" && barrier === "3") return PAROLI_TAIL_MULTIPLE;
+  if (contract === "DIGITOVER" && barrier === "4") return PAROLI_HALF_MULTIPLE;
+  if (contract === "DIGITUNDER" && barrier === "5") return PAROLI_HALF_MULTIPLE;
+  return PAROLI_CUSHION_MULTIPLE;
+}
+
+export function tailLegRequest(tail: ParoliTail, stake: number): LegRequest {
+  return tail === "over"
+    ? { contract: "DIGITOVER", barrier: "6", stake: round2(stake), label: "Over 6" }
+    : { contract: "DIGITUNDER", barrier: "3", stake: round2(stake), label: "Under 3" };
+}
+
+export function halfLegRequest(tail: ParoliTail, stake: number): LegRequest {
+  return tail === "over"
+    ? { contract: "DIGITOVER", barrier: "4", stake: round2(stake), label: "Over 4" }
+    : { contract: "DIGITUNDER", barrier: "5", stake: round2(stake), label: "Under 5" };
+}
+
+export function step2Requests(
+  mode: ProgressionMode,
+  tail: ParoliTail,
+  step1Payout: number,
+  baseStake: number,
+  reinvestPct: number,
+): LegRequest[] {
+  const pct = clampReinvestPct(reinvestPct);
+  if (mode === "paroli_cushion") {
+    const budget = round2(step1Payout * (pct / 100));
+    const legA = Math.max(PAROLI_MIN_STAKE, round2(budget / 2));
+    const legB = Math.max(PAROLI_MIN_STAKE, round2(budget - legA));
+    return [
+      { contract: "DIGITOVER", barrier: "3", stake: legA, label: "Over 3" },
+      { contract: "DIGITUNDER", barrier: "6", stake: legB, label: "Under 6" },
+    ];
+  }
+  if (mode === "parachute_skim") {
+    const pureProfit = Math.max(PAROLI_MIN_STAKE, round2((step1Payout - clampStake(baseStake)) * (pct / 100)));
+    return [halfLegRequest(tail, pureProfit)];
+  }
+  if (mode === "classic_tail") return [tailLegRequest(tail, stepStakeFor(step1Payout, pct))];
+  return [halfLegRequest(tail, stepStakeFor(step1Payout, pct))];
+}
+
+export function step3Requests(mode: ProgressionMode, tail: ParoliTail, step2Payout: number, reinvestPct: number): LegRequest[] {
+  void mode;
+  return [tailLegRequest(tail, stepStakeFor(step2Payout, reinvestPct))];
+}
+
+/** The spec's auto target: max(1.00, quarter-rounded 2x the expected burst profit). */
+export function modeAutoTakeProfit(netBurstProfit: number): number {
+  return Math.max(PAROLI_AUTO_TP_FLOOR, roundQuarter(Math.max(0, netBurstProfit) * PAROLI_TP_MULTIPLE));
+}
+
+export function buildModePlan(
+  mode: ProgressionMode,
+  baseStake: number,
+  steps: number,
+  reinvestPct: number,
+  tail: ParoliTail = "over",
+): ModePlan {
+  const safeBase = clampStake(baseStake);
+  const pct = clampReinvestPct(reinvestPct);
+  const totalSteps = modeSteps(mode, steps);
+  const planSteps: ModeStep[] = [];
+  let cumulativeStake = 0;
+  let cumulativePayout = 0;
+  const pushStep = (step: number, requests: LegRequest[]): void => {
+    const legs: ModeLeg[] = requests.map((request) => ({
+      ...request,
+      payout: round2(request.stake * legMultiple(request.contract, request.barrier)),
+    }));
+    const stake = round2(legs.reduce((sum, leg) => sum + leg.stake, 0));
+    const payout = round2(legs.reduce((sum, leg) => sum + leg.payout, 0));
+    cumulativeStake = round2(cumulativeStake + stake);
+    cumulativePayout = round2(cumulativePayout + payout);
+    planSteps.push({
+      step,
+      legs,
+      stake,
+      payout,
+      profit: round2(payout - stake),
+      cumulativeStake,
+      cumulativePayout,
+    });
+  };
+
+  pushStep(1, [tailLegRequest(tail, safeBase)]);
+  const step1 = planSteps[0];
+  pushStep(2, step2Requests(mode, tail, step1.payout, safeBase, pct));
+  const step2 = planSteps[1];
+  if (totalSteps >= 3) pushStep(3, step3Requests(mode, tail, step2.payout, pct));
+
+  const netProfit = round2(cumulativePayout - cumulativeStake);
+  const guaranteedNet =
+    mode === "paroli_cushion"
+      ? round2(step1.payout - safeBase - step2.stake + Math.min(...step2.legs.map((leg) => leg.payout)))
+      : netProfit;
+  const step2MissPnL = mode === "paroli_cushion" ? guaranteedNet : round2(step1.payout - safeBase - step2.stake);
+  const step2MissLabel =
+    mode === "paroli_cushion"
+      ? "+$" + Math.abs(guaranteedNet).toFixed(2) + " guaranteed"
+      : Math.abs(step2MissPnL) < 0.005
+        ? "$0.00 break-even"
+        : "-$" + Math.abs(step2MissPnL).toFixed(2);
+
+  return {
+    mode,
+    baseStake: safeBase,
+    steps: planSteps,
+    totalSteps,
+    netProfit,
+    guaranteedNet,
+    maxRisk: safeBase,
+    step2MissPnL,
+    step2MissLabel,
+    roiPct: safeBase > 0 ? round2((netProfit / safeBase) * 100) : 0,
+    autoStopLoss: autoStopLoss(safeBase),
+    autoTakeProfit: modeAutoTakeProfit(mode === "paroli_cushion" ? guaranteedNet : netProfit),
+  };
+}
+
+export interface Step2RadarCard {
+  symbol: string;
+  enabled: boolean;
+  ready: boolean;
+  order: number;
+  lowStreak: number;
+  highStreak: number;
+  centerDrought: number;
+  high: number;
+  low: number;
+}
+
+export interface Step2Trigger {
+  symbol: string;
+  /** "cushion" fires both legs; "over"/"under" pick the single Step-2 leg. */
+  kind: "cushion" | "over" | "under";
+  metric: number;
+}
+
+export interface Step2Options {
+  clusterThreshold: number;
+  centerThreshold: number;
+  droughtThreshold: number;
+  direction: ParoliDirection;
+  /** False only for the manual override, which fires the strongest card immediately. */
+  requireThreshold?: boolean;
+}
+
+/**
+ * Step-2 cross-symbol scan. The first eligible card to satisfy the mode's
+ * condition wins; ties fall back to pool order, then the Over side.
+ */
+export function pickStep2Trigger(
+  cards: readonly Step2RadarCard[],
+  mode: ProgressionMode,
+  options: Step2Options,
+): Step2Trigger | null {
+  const requireThreshold = options.requireThreshold !== false;
+  const eligible = cards.filter((card) => card.enabled && card.ready).sort((a, b) => a.order - b.order);
+  if (eligible.length === 0) return null;
+
+  if (mode === "paroli_cushion") {
+    const limit = requireThreshold ? clampCenter(options.centerThreshold) : 0;
+    let best: Step2RadarCard | null = null;
+    for (const card of eligible) {
+      if (card.centerDrought >= limit && (!best || card.centerDrought > best.centerDrought)) best = card;
+    }
+    return best ? { symbol: best.symbol, kind: "cushion", metric: best.centerDrought } : null;
+  }
+
+  if (mode === "classic_tail") {
+    const limit = requireThreshold ? clampThreshold(options.droughtThreshold) : 0;
+    let best: { card: Step2RadarCard; kind: "over" | "under"; metric: number } | null = null;
+    for (const card of eligible) {
+      if (directionAllows(options.direction, "over") && card.high >= limit && (!best || card.high > best.metric)) {
+        best = { card, kind: "over", metric: card.high };
+      }
+      if (directionAllows(options.direction, "under") && card.low >= limit && (!best || card.low > best.metric)) {
+        best = { card, kind: "under", metric: card.low };
+      }
+    }
+    return best ? { symbol: best.card.symbol, kind: best.kind, metric: best.metric } : null;
+  }
+
+  const limit = requireThreshold ? clampCluster(options.clusterThreshold) : 0;
+  let best: { card: Step2RadarCard; kind: "over" | "under"; metric: number } | null = null;
+  for (const card of eligible) {
+    if (directionAllows(options.direction, "over") && card.lowStreak >= limit && (!best || card.lowStreak > best.metric)) {
+      best = { card, kind: "over", metric: card.lowStreak };
+    }
+    if (directionAllows(options.direction, "under") && card.highStreak >= limit && (!best || card.highStreak > best.metric)) {
+      best = { card, kind: "under", metric: card.highStreak };
+    }
+  }
+  return best ? { symbol: best.card.symbol, kind: best.kind, metric: best.metric } : null;
 }
