@@ -67,6 +67,7 @@ export interface ContractOffer {
   maxContractDuration: string;
   expiryType: string;
   barrier: string | null;
+  barrierChoices?: string[];
   defaultStake: number;
   pipSize: number;
   underlyingSymbol: string;
@@ -363,6 +364,8 @@ export class DerivSession {
     return rows.map((row) => {
       const item = typeof row === "object" && row !== null ? (row as Record<string, unknown>) : {};
       const barrier = item.barrier === null || item.barrier === undefined ? null : String(item.barrier);
+      const rawChoices = Array.isArray(item.barrier_choices) ? item.barrier_choices : [];
+      const barrierChoices = rawChoices.map((choice) => String(choice)).filter((choice) => choice.length > 0);
       return {
         contractType: String(item.contract_type ?? ""),
         contractCategory: String(item.contract_category ?? ""),
@@ -370,6 +373,7 @@ export class DerivSession {
         maxContractDuration: String(item.max_contract_duration ?? ""),
         expiryType: String(item.expiry_type ?? ""),
         barrier,
+        barrierChoices,
         defaultStake: num(item.default_stake),
         pipSize: num(item.pip_size),
         underlyingSymbol: String(item.underlying_symbol ?? symbol),
