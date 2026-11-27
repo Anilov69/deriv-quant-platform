@@ -11,6 +11,7 @@ import GapEnginePage from "@/pages/GapEnginePage";
 import MeshHedgePage from "@/pages/MeshHedgePage";
 import TouchStraddlePage from "@/pages/TouchStraddlePage";
 import ParoliSniperPage from "@/pages/ParoliSniperPage";
+import TimeCollarPage from "@/pages/TimeCollarPage";
 import {
   digitsFrom,
   entropyBits,
@@ -35,7 +36,7 @@ interface Notice {
   text: string;
 }
 
-type Route = "home" | "gap" | "mesh" | "straddle" | "paroli";
+type Route = "home" | "gap" | "mesh" | "straddle" | "paroli" | "collar";
 
 /** GitHub Pages has no server-side routing, so the page lives in the hash. */
 function readRoute(): Route {
@@ -44,6 +45,7 @@ function readRoute(): Route {
   if (path === "mesh-hedge") return "mesh";
   if (path === "touch-straddle") return "straddle";
   if (path === "paroli-sniper") return "paroli";
+  if (path === "time-collar") return "collar";
   return "home";
 }
 
@@ -165,6 +167,7 @@ export default function App(): ReactElement {
   const meshContractRef = useRef<((payload: any) => void) | null>(null);
   const touchContractRef = useRef<((payload: any) => void) | null>(null);
   const paroliContractRef = useRef<((payload: any) => void) | null>(null);
+  const collarContractRef = useRef<((payload: any) => void) | null>(null);
 
   useEffect(() => {
     routeRef.current = route;
@@ -199,6 +202,7 @@ export default function App(): ReactElement {
       meshContractRef.current?.(payload);
       touchContractRef.current?.(payload);
       paroliContractRef.current?.(payload);
+      collarContractRef.current?.(payload);
       if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
@@ -254,6 +258,10 @@ export default function App(): ReactElement {
 
   const bindParoliContractListener = useCallback((handler: ((payload: any) => void) | null) => {
     paroliContractRef.current = handler;
+  }, []);
+
+  const bindCollarContractListener = useCallback((handler: ((payload: any) => void) | null) => {
+    collarContractRef.current = handler;
   }, []);
 
   const switchAccount = useCallback((next: string) => {
@@ -510,7 +518,7 @@ export default function App(): ReactElement {
           <h1 className="text-base font-semibold tracking-tight">Digit Edge</h1>
           <p className="text-xs text-muted">Contract-ladder search for Deriv synthetic indices</p>
         </div>
-        <nav className="grid w-full grid-cols-5 gap-1 text-xs sm:flex sm:w-auto sm:items-center" aria-label="Pages">
+        <nav className="grid w-full grid-cols-6 gap-1 text-xs sm:flex sm:w-auto sm:items-center" aria-label="Pages">
           <a href="#/" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "home" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Main Terminal
           </a>
@@ -525,6 +533,9 @@ export default function App(): ReactElement {
           </a>
           <a href="#/paroli-sniper" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "paroli" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Paroli Sniper
+          </a>
+          <a href="#/time-collar" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "collar" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Time Collar
           </a>
         </nav>
         <div className="flex items-center gap-3 text-xs">
@@ -664,6 +675,21 @@ export default function App(): ReactElement {
           onAccountChange={switchAccount}
           onNotice={notify}
           bindContractListener={bindParoliContractListener}
+        />
+      ) : route === "collar" ? (
+        <TimeCollarPage
+          sessionRef={sessionRef}
+          connected={live}
+          symbols={symbols}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindCollarContractListener}
         />
       ) : (
         <>
