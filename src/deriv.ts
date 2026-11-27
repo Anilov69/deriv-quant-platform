@@ -511,6 +511,15 @@ export class DerivSession {
     return String(message?.subscription?.id ?? "");
   }
 
+  /**
+   * Market-sell an open contract. price: 0 asks Deriv for the executable bid;
+   * the authoritative exit P&L still arrives through proposal_open_contract.
+   */
+  async sell(contractId: number, price = 0): Promise<void> {
+    if (!Number.isFinite(contractId) || contractId <= 0) throw new DerivError("NoContract", "No open contract to sell.");
+    await this.send({ sell: contractId, price: Math.max(0, price) });
+  }
+
   disconnect(): void {
     this.closing = true;
     this.closeSocket();

@@ -12,6 +12,7 @@ import MeshHedgePage from "@/pages/MeshHedgePage";
 import TouchStraddlePage from "@/pages/TouchStraddlePage";
 import ParoliSniperPage from "@/pages/ParoliSniperPage";
 import TimeCollarPage from "@/pages/TimeCollarPage";
+import QuantDeskPage from "@/pages/QuantDeskPage";
 import {
   digitsFrom,
   entropyBits,
@@ -36,7 +37,7 @@ interface Notice {
   text: string;
 }
 
-type Route = "home" | "gap" | "mesh" | "straddle" | "paroli" | "collar";
+type Route = "home" | "gap" | "mesh" | "straddle" | "paroli" | "collar" | "quant";
 
 /** GitHub Pages has no server-side routing, so the page lives in the hash. */
 function readRoute(): Route {
@@ -46,6 +47,7 @@ function readRoute(): Route {
   if (path === "touch-straddle") return "straddle";
   if (path === "paroli-sniper") return "paroli";
   if (path === "time-collar") return "collar";
+  if (path === "quant-desk") return "quant";
   return "home";
 }
 
@@ -168,13 +170,26 @@ export default function App(): ReactElement {
   const touchContractRef = useRef<((payload: any) => void) | null>(null);
   const paroliContractRef = useRef<((payload: any) => void) | null>(null);
   const collarContractRef = useRef<((payload: any) => void) | null>(null);
+  const quantContractRef = useRef<((payload: unknown) => void) | null>(null);
+  const quantNavigationGuardRef = useRef<(() => string | null) | null>(null);
 
   useEffect(() => {
     routeRef.current = route;
   }, [route]);
 
   useEffect(() => {
-    const onHash = () => setRoute(readRoute());
+    const onHash = () => {
+      const next = readRoute();
+      if (next !== "quant" && routeRef.current === "quant") {
+        const blocked = quantNavigationGuardRef.current?.() ?? null;
+        if (blocked) {
+          window.history.replaceState(null, "", "#/quant-desk");
+          setNotice({ tone: "bad", text: blocked });
+          return;
+        }
+      }
+      setRoute(next);
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
@@ -203,6 +218,7 @@ export default function App(): ReactElement {
       touchContractRef.current?.(payload);
       paroliContractRef.current?.(payload);
       collarContractRef.current?.(payload);
+      quantContractRef.current?.(payload);
       if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
@@ -262,6 +278,14 @@ export default function App(): ReactElement {
 
   const bindCollarContractListener = useCallback((handler: ((payload: any) => void) | null) => {
     collarContractRef.current = handler;
+  }, []);
+
+  const bindQuantContractListener = useCallback((handler: ((payload: unknown) => void) | null) => {
+    quantContractRef.current = handler;
+  }, []);
+
+  const bindQuantNavigationGuard = useCallback((handler: (() => string | null) | null) => {
+    quantNavigationGuardRef.current = handler;
   }, []);
 
   const switchAccount = useCallback((next: string) => {
@@ -518,7 +542,7 @@ export default function App(): ReactElement {
           <h1 className="text-base font-semibold tracking-tight">Digit Edge</h1>
           <p className="text-xs text-muted">Contract-ladder search for Deriv synthetic indices</p>
         </div>
-        <nav className="grid w-full grid-cols-6 gap-1 text-xs sm:flex sm:w-auto sm:items-center" aria-label="Pages">
+        <nav className="grid w-full grid-cols-4 gap-1 text-xs md:flex md:w-auto md:items-center" aria-label="Pages">
           <a href="#/" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "home" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Main Terminal
           </a>
@@ -536,6 +560,9 @@ export default function App(): ReactElement {
           </a>
           <a href="#/time-collar" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "collar" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Time Collar
+          </a>
+          <a href="#/quant-desk" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "quant" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Quant Desk
           </a>
         </nav>
         <div className="flex items-center gap-3 text-xs">
@@ -690,6 +717,21 @@ export default function App(): ReactElement {
           onAccountChange={switchAccount}
           onNotice={notify}
           bindContractListener={bindCollarContractListener}
+        />
+      ) : route === "quant" ? (
+        <QuantDeskPage
+          sessionRef={sessionRef}
+          connected={live}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindQuantContractListener}
+          bindNavigationGuard={bindQuantNavigationGuard}
         />
       ) : (
         <>

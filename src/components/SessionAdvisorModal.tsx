@@ -22,7 +22,7 @@ interface Props {
   onDismiss: () => void;
   onReset: () => void;
   /** Optional copy variant. The mesh page keeps the original wording by default. */
-  variant?: 'mesh' | 'straddle' | 'paroli' | 'collar';
+  variant?: 'mesh' | 'straddle' | 'paroli' | 'collar' | 'quant';
 }
 
 interface AdvisorConfig {
@@ -229,6 +229,54 @@ const COLLAR_CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
   },
 };
 
+const QUANT_CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
+  TP_HIT: {
+    durationSec: 300,
+    badge: 'TAKE PROFIT HIT',
+    action: 'Stop Trading for 5 Minutes',
+    message:
+      'The Quant Desk reached its Take Profit target. Every stored win came from a finite-sample probability estimate, not from a guaranteed market edge; the next proposal is independent and the house margin has not changed. Step away for 5 minutes and restart at the base stake.',
+    bullets: [
+      'Do not lower the EV gate or enlarge the Kelly fraction to force another setup.',
+      'Review the quant audit log and export the CSV while the 5-minute timer cools down.',
+    ],
+    shell: 'border-accent/60',
+    badgeTone: 'bg-accent text-ink',
+    accent: 'text-accent',
+    primary: 'bg-accent text-ink hover:bg-accent/90',
+  },
+  SL_PARTIAL_WINS: {
+    durationSec: 600,
+    badge: 'STOP LOSS — PARTIAL WINS',
+    action: 'Pause Trading for 10 Minutes',
+    message:
+      'The Quant Desk hit its Stop Loss after at least one stored win. When the rolling win rate falls more than 15 percentage points below the average implied breakeven, the edge estimate has drifted; continuing to scan with the same assumptions would be curve-fitting to stale features. Pause for 10 minutes and let the regimes refresh.',
+    bullets: [
+      'Do not lower the EV gate or raise the stake to recover the drawdown.',
+      'Confirm the wallet still holds at least 3× the $2.10 auto stop before resuming, and prefer Demo for the first new scan.',
+    ],
+    shell: 'border-amber-400/60',
+    badgeTone: 'bg-amber-400 text-ink',
+    accent: 'text-amber-300',
+    primary: 'bg-amber-400 text-ink hover:bg-amber-300',
+  },
+  SL_ZERO_WINS: {
+    durationSec: 900,
+    badge: 'STOP LOSS — ZERO WINS',
+    action: 'Step Away for 15 Minutes (or Switch to Demo)',
+    message:
+      'No settled Quant Desk trade has produced a positive net result. The classifier can be perfectly consistent and still lose: Deriv prices in a margin, and a high realized probability does not make a binary contract certain. The edge-drift breaker has paused new execution; take 15 minutes before arming again.',
+    bullets: [
+      'Never restart at a higher stake or a lower EV threshold after a 0-win stop-out.',
+      'After the cooldown, verify contracts_for and live proposals on Demo before returning to Real.',
+    ],
+    shell: 'border-danger/60',
+    badgeTone: 'bg-danger text-ink',
+    accent: 'text-danger',
+    primary: 'bg-danger text-ink hover:bg-danger/90',
+  },
+};
+
 function formatClock(totalSeconds: number): string {
   const safe = Math.max(0, Math.ceil(totalSeconds));
   const minutes = Math.floor(safe / 60);
@@ -257,7 +305,12 @@ export default function SessionAdvisorModal({
   onReset,
   variant = 'mesh',
 }: Props): ReactElement | null {
-  const configForMode = variant === 'straddle' ? STRADDLE_CONFIG : variant === 'paroli' ? PAROLI_CONFIG : variant === 'collar' ? COLLAR_CONFIG : CONFIG;
+  const configForMode =
+    variant === 'straddle' ? STRADDLE_CONFIG :
+    variant === 'paroli' ? PAROLI_CONFIG :
+    variant === 'collar' ? COLLAR_CONFIG :
+    variant === 'quant' ? QUANT_CONFIG :
+    CONFIG;
   const duration = state ? configForMode[state.mode].durationSec : 0;
   const [left, setLeft] = useState(duration);
   const deadlineRef = useRef(0);
@@ -322,10 +375,10 @@ export default function SessionAdvisorModal({
               {state.pnl >= 0 ? '+' : '-'}<Money value={Math.abs(state.pnl)} currency={currency} />
             </span>
           </Stat>
-          <Stat label={variant === 'paroli' ? 'Bursts settled' : variant === 'collar' ? 'Collars settled' : 'Rounds played'}>
+          <Stat label={variant === 'paroli' ? 'Bursts settled' : variant === 'collar' ? 'Collars settled' : variant === 'quant' ? 'Trades settled' : 'Rounds played'}>
             {state.wins + state.losses} <span className='text-[10px] text-muted'>({state.wins} W / {state.losses} L)</span>
           </Stat>
-          <Stat label={variant === 'paroli' ? 'Peak Paroli step' : variant === 'collar' ? 'Peak collar level' : 'Peak martingale'}>L{state.peakLevel}</Stat>
+          <Stat label={variant === 'paroli' ? 'Peak Paroli step' : variant === 'collar' ? 'Peak collar level' : variant === 'quant' ? 'Execution mode' : 'Peak martingale'}>{variant === 'quant' ? 'POST-TRADE' : 'L' + state.peakLevel}</Stat>
           <Stat label='Session limits'>
             <span className='text-[10px]'>SL {state.stopLoss.toFixed(2)} / TP {state.takeProfit.toFixed(2)}</span>
           </Stat>
@@ -348,7 +401,7 @@ export default function SessionAdvisorModal({
             </p>
           </div>
           <p className='mt-2 text-[10px] leading-relaxed text-muted'>
-            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the {variant === 'straddle' ? 'barrier channel' : variant === 'paroli' ? 'radar pool' : variant === 'collar' ? 'collar corridor' : 'mesh'} and history without arming another trade.
+            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the {variant === 'straddle' ? 'barrier channel' : variant === 'paroli' ? 'radar pool' : variant === 'collar' ? 'collar corridor' : variant === 'quant' ? 'quant matrix' : 'mesh'} and history without arming another trade.
           </p>
         </div>
 

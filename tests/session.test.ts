@@ -97,6 +97,8 @@ class MockSocket {
       this.emit({ proposal: { id: "quote-1", ask_price: 1, payout: 8.93, spot: 446.62 }, ...req });
     } else if (payload.buy !== undefined) {
       this.emit({ buy: { contract_id: 777, buy_price: payload.price }, ...req });
+    } else if (payload.sell !== undefined) {
+      this.emit({ sell: { sold_for: 1.01, transaction_id: 9001 }, ...req });
     } else if (payload.proposal_open_contract !== undefined) {
       this.emit({
         msg_type: "proposal_open_contract",
@@ -238,6 +240,12 @@ describe("requests", () => {
     const buyFrame = socket.sent.find((item) => item.buy !== undefined);
     expect(buyFrame?.price).toBe(1);
     expect(typeof buyFrame?.price).toBe("number");
+
+    await session.sell(contractId, 0);
+    const sellFrame = socket.sent.find((item) => item.sell !== undefined);
+    expect(sellFrame?.sell).toBe(777);
+    expect(sellFrame?.price).toBe(0);
+    expect(typeof sellFrame?.price).toBe("number");
   });
 
   it("paces proposals so a batch cannot trip Deriv's burst limit", async () => {
