@@ -561,6 +561,10 @@ export default function ParoliSniperPage(props: Props): ReactElement {
             burstRef.current = current;
             setBurst(current);
           }
+          if (!aliveRef.current) {
+            if (watchId) void session.forget(watchId);
+            return;
+          }
           const payload = await settlement;
           if (!aliveRef.current) return;
           const data = asContract(payload);
@@ -1029,7 +1033,7 @@ export default function ParoliSniperPage(props: Props): ReactElement {
 
   useEffect(() => {
     const session = sessionRef.current;
-    if (!connected || !session) return;
+    if (!connected || !session || !accountId || session.accountId !== accountId) return;
     aliveRef.current = true;
     const handler = (symbol: string, tick: Tick): void => {
       handleTick(symbol, tick);
