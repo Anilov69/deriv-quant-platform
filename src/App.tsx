@@ -10,6 +10,7 @@ import AutoTradePanel from "@/AutoTradePanel";
 import GapEnginePage from "@/pages/GapEnginePage";
 import MeshHedgePage from "@/pages/MeshHedgePage";
 import TouchStraddlePage from "@/pages/TouchStraddlePage";
+import ParoliSniperPage from "@/pages/ParoliSniperPage";
 import {
   digitsFrom,
   entropyBits,
@@ -34,7 +35,7 @@ interface Notice {
   text: string;
 }
 
-type Route = "home" | "gap" | "mesh" | "straddle";
+type Route = "home" | "gap" | "mesh" | "straddle" | "paroli";
 
 /** GitHub Pages has no server-side routing, so the page lives in the hash. */
 function readRoute(): Route {
@@ -42,6 +43,7 @@ function readRoute(): Route {
   if (path === "gap-engine") return "gap";
   if (path === "mesh-hedge") return "mesh";
   if (path === "touch-straddle") return "straddle";
+  if (path === "paroli-sniper") return "paroli";
   return "home";
 }
 
@@ -162,6 +164,7 @@ export default function App(): ReactElement {
   const gapContractRef = useRef<((payload: any) => void) | null>(null);
   const meshContractRef = useRef<((payload: any) => void) | null>(null);
   const touchContractRef = useRef<((payload: any) => void) | null>(null);
+  const paroliContractRef = useRef<((payload: any) => void) | null>(null);
 
   useEffect(() => {
     routeRef.current = route;
@@ -195,6 +198,7 @@ export default function App(): ReactElement {
       gapContractRef.current?.(payload);
       meshContractRef.current?.(payload);
       touchContractRef.current?.(payload);
+      paroliContractRef.current?.(payload);
       if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
@@ -246,6 +250,10 @@ export default function App(): ReactElement {
 
   const bindTouchContractListener = useCallback((handler: ((payload: any) => void) | null) => {
     touchContractRef.current = handler;
+  }, []);
+
+  const bindParoliContractListener = useCallback((handler: ((payload: any) => void) | null) => {
+    paroliContractRef.current = handler;
   }, []);
 
   const switchAccount = useCallback((next: string) => {
@@ -502,18 +510,21 @@ export default function App(): ReactElement {
           <h1 className="text-base font-semibold tracking-tight">Digit Edge</h1>
           <p className="text-xs text-muted">Contract-ladder search for Deriv synthetic indices</p>
         </div>
-        <nav className="flex items-center gap-1 text-xs" aria-label="Pages">
-          <a href="#/" className={"rounded px-2 py-1 " + (route === "home" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+        <nav className="grid w-full grid-cols-5 gap-1 text-xs sm:flex sm:w-auto sm:items-center" aria-label="Pages">
+          <a href="#/" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "home" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Main Terminal
           </a>
-          <a href="#/gap-engine" className={"rounded px-2 py-1 " + (route === "gap" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+          <a href="#/gap-engine" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "gap" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Gap Engine
           </a>
-          <a href="#/mesh-hedge" className={"rounded px-2 py-1 " + (route === "mesh" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+          <a href="#/mesh-hedge" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "mesh" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Mesh Hedge
           </a>
-          <a href="#/touch-straddle" className={"rounded px-2 py-1 " + (route === "straddle" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+          <a href="#/touch-straddle" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "straddle" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Touch Straddle
+          </a>
+          <a href="#/paroli-sniper" className={"whitespace-normal rounded px-1 py-1 text-center text-[9px] sm:whitespace-nowrap sm:px-2 sm:text-xs " + (route === "paroli" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Paroli Sniper
           </a>
         </nav>
         <div className="flex items-center gap-3 text-xs">
@@ -638,6 +649,21 @@ export default function App(): ReactElement {
           onAccountChange={switchAccount}
           onNotice={notify}
           bindContractListener={bindTouchContractListener}
+        />
+      ) : route === "paroli" ? (
+        <ParoliSniperPage
+          sessionRef={sessionRef}
+          connected={live}
+          symbols={symbols}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindParoliContractListener}
         />
       ) : (
         <>

@@ -161,6 +161,8 @@ export class DerivSession {
   onStatus: ((status: Status, detail: string) => void) | null = null;
   onTick: ((tick: Tick) => void) | null = null;
   onTickFor: ((symbol: string, tick: Tick) => void) | null = null;
+  /** Additive broadcast for pages that watch several symbols at once. */
+  onTickAny: ((symbol: string, tick: Tick) => void) | null = null;
   onSymbols: ((symbols: SymbolInfo[]) => void) | null = null;
   onBalance: ((balance: number, currency: string) => void) | null = null;
   onContract: ((contract: any) => void) | null = null;
@@ -170,7 +172,9 @@ export class DerivSession {
   private pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
   private sequence = 1;
   private tickSubscription: string | null = null;
+  private tickSubscriptionSymbol = "";
   private tickSymbols = new Map<string, string>();
+  private tickRequests = new Map<number, { symbol: string; legacy: boolean }>();
   private ping: ReturnType<typeof setInterval> | undefined;
   private token = "";
   private appId = "";
@@ -269,6 +273,7 @@ export class DerivSession {
       if (reqId !== undefined && this.pending.has(reqId)) {
         const entry = this.pending.get(reqId)!;
         this.pending.delete(reqId);
+        this.tickRequests.delete(reqId);
         entry.reject(new DerivError(String(message.error.code ?? "ApiError"), text));
         return;
       }
@@ -280,7 +285,21 @@ export class DerivSession {
       // The first frame of a ticks subscription carries the req_id too, so the
       // awaiting caller still needs resolving below.
       const tick = { epoch: num(message.tick.epoch), quote: num(message.tick.quote) };
-      const owner = message.subscription?.id ? this.tickSymbols.get(String(message.subscription.id)) : undefined;
+      const reqId = num(message.req_id, 0);
+      const requested = reqId ? this.tickRequests.get(reqId) : undefined;
+      const subscriptionId = String(message.subscription?.id ?? "");
+      if (requested && subscriptionId) {
+        if (requested.legacy) {
+          this.tickSubscription = subscriptionId;
+          this.tickSubscriptionSymbol = requested.symbol;
+        } else {
+          this.tickSymbols.set(subscriptionId, requested.symbol);
+        }
+      }
+      const owner = subscriptionId ? this.tickSymbols.get(subscriptionId) : undefined;
+      const legacy = !owner && subscriptionId && subscriptionId === this.tickSubscription ? this.tickSubscriptionSymbol : "";
+      const tickSymbol = String(message.tick.symbol ?? owner ?? legacy ?? "");
+      if (tickSymbol) this.onTickAny?.(tickSymbol, tick);
       if (owner) this.onTickFor?.(owner, tick);
       else this.onTick?.(tick);
     }
@@ -296,22 +315,25 @@ export class DerivSession {
     if (reqId !== undefined && this.pending.has(reqId)) {
       const entry = this.pending.get(reqId)!;
       this.pending.delete(reqId);
+      this.tickRequests.delete(reqId);
       entry.resolve(message);
     }
   }
 
-  private send(payload: Record<string, unknown>): Promise<any> {
+  private send(payload: Record<string, unknown>, tickRequest?: { symbol: string; legacy: boolean }): Promise<any> {
     const socket = this.socket;
     if (!socket || socket.readyState !== WebSocket.OPEN) {
       return Promise.reject(new DerivError("NotConnected", "Connect to Deriv first."));
     }
     const reqId = this.sequence++;
+    if (tickRequest) this.tickRequests.set(reqId, tickRequest);
     return new Promise((resolve, reject) => {
       this.pending.set(reqId, { resolve, reject });
       socket.send(JSON.stringify({ ...payload, req_id: reqId }));
       setTimeout(() => {
         if (this.pending.has(reqId)) {
           this.pending.delete(reqId);
+          this.tickRequests.delete(reqId);
           reject(new DerivError("Timeout", "Deriv did not answer in time."));
         }
       }, WS_TIMEOUT_MS);
@@ -355,8 +377,10 @@ export class DerivSession {
     });
   }
 
-  async history(symbol: string, count: number): Promise<Tick[]> {
-    const message = await this.send({ ticks_history: symbol, count, end: "latest" });
+  async history(symbol: string, count: number, style?: "ticks"): Promise<Tick[]> {
+    const payload: Record<string, unknown> = { ticks_history: symbol, count, end: "latest" };
+    if (style) payload.style = style;
+    const message = await this.send(payload);
     const prices: any[] = Array.isArray(message?.history?.prices) ? message.history.prices : [];
     const times: any[] = Array.isArray(message?.history?.times) ? message.history.times : [];
     return prices.map((price, index) => ({ quote: num(price), epoch: num(times[index]) }));
@@ -371,8 +395,9 @@ export class DerivSession {
       }
       this.tickSubscription = null;
     }
-    const message = await this.send({ ticks: symbol, subscribe: 1 });
+    const message = await this.send({ ticks: symbol, subscribe: 1 }, { symbol, legacy: true });
     this.tickSubscription = String(message?.subscription?.id ?? "");
+    this.tickSubscriptionSymbol = symbol;
   }
 
   /**
@@ -380,7 +405,7 @@ export class DerivSession {
    * terminal's own subscription keeps its symbol. Returns the subscription id.
    */
   async subscribeTicksFor(symbol: string): Promise<string> {
-    const message = await this.send({ ticks: symbol, subscribe: 1 });
+    const message = await this.send({ ticks: symbol, subscribe: 1 }, { symbol, legacy: false });
     const id = String(message?.subscription?.id ?? "");
     if (id) this.tickSymbols.set(id, symbol);
     return id;
@@ -490,6 +515,9 @@ export class DerivSession {
     this.closing = true;
     this.closeSocket();
     this.tickSubscription = null;
+    this.tickSubscriptionSymbol = "";
+    this.tickSymbols.clear();
+    this.tickRequests.clear();
     this.setStatus("idle", "Disconnected");
   }
 
@@ -500,6 +528,10 @@ export class DerivSession {
     }
     const socket = this.socket;
     this.socket = null;
+    this.tickSubscription = null;
+    this.tickSubscriptionSymbol = "";
+    this.tickSymbols.clear();
+    this.tickRequests.clear();
     if (socket) {
       socket.onopen = null;
       socket.onerror = null;

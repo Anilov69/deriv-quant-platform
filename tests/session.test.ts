@@ -255,14 +255,19 @@ describe("requests", () => {
   });
 
   it("streams ticks and seeds history for the same symbol", async () => {
-    const { session } = await connect();
+    const { session, socket } = await connect();
     const ticks: number[] = [];
+    const broadcast: string[] = [];
     session.onTick = (tick) => ticks.push(tick.quote);
+    session.onTickAny = (symbol, tick) => broadcast.push(symbol + ":" + tick.quote);
     await session.subscribeTicks("R_100");
     await new Promise((resolve) => setTimeout(resolve, 5));
     expect(ticks).toEqual([446.62]);
-    const history = await session.history("R_100", 3);
+    expect(broadcast).toEqual(["R_100:446.62"]);
+    const history = await session.history("R_100", 3, "ticks");
     expect(history.map((tick) => tick.quote)).toEqual([446.6, 446.61, 446.62]);
+    const historyFrame = socket.sent.find((item) => item.ticks_history !== undefined);
+    expect(historyFrame?.style).toBe("ticks");
   });
 
   it("surfaces a Deriv error to the caller instead of hanging", async () => {

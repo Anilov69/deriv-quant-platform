@@ -22,7 +22,7 @@ interface Props {
   onDismiss: () => void;
   onReset: () => void;
   /** Optional copy variant. The mesh page keeps the original wording by default. */
-  variant?: 'mesh' | 'straddle';
+  variant?: 'mesh' | 'straddle' | 'paroli';
 }
 
 interface AdvisorConfig {
@@ -133,6 +133,54 @@ const STRADDLE_CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
   },
 };
 
+const PAROLI_CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
+  TP_HIT: {
+    durationSec: 300,
+    badge: 'TAKE PROFIT HIT',
+    action: 'Stop Trading for 5 Minutes',
+    message:
+      'Your Paroli burst ladder reached Take Profit. The last roll was paid by house money, but each new burst still starts at the base stake and each 1-tick digit contract is independent. Step away for 5 minutes, then restart at the base stake instead of trying to compound the win.',
+    bullets: [
+      'Keep the next burst at the same base stake and reinvestment percentage.',
+      'Review the grouped burst history or export the CSV while the 5-minute timer cools down.',
+    ],
+    shell: 'border-accent/60',
+    badgeTone: 'bg-accent text-ink',
+    accent: 'text-accent',
+    primary: 'bg-accent text-ink hover:bg-accent/90',
+  },
+  SL_PARTIAL_WINS: {
+    durationSec: 600,
+    badge: 'STOP LOSS — PARTIAL WINS',
+    action: 'Pause Trading for 10 Minutes',
+    message:
+      'Your Paroli Stop Loss cut off a cold stretch after at least one winning first step. A later losing step at 100% reinvestment only gives back the base stake; the earlier win was already banked. Long droughts are normal on a random feed, so pause for 10 minutes instead of chasing the next trigger.',
+    bullets: [
+      'Do not raise the base stake, add a fourth step, or lower the drought threshold to win it back faster.',
+      'Confirm the remaining wallet still holds at least 3× the one-burst Stop Loss before resuming.',
+    ],
+    shell: 'border-amber-400/60',
+    badgeTone: 'bg-amber-400 text-ink',
+    accent: 'text-amber-300',
+    primary: 'bg-amber-400 text-ink hover:bg-amber-300',
+  },
+  SL_ZERO_WINS: {
+    durationSec: 900,
+    badge: 'STOP LOSS — ZERO WINS',
+    action: 'Step Away for 15 Minutes (or Switch to Demo)',
+    message:
+      'Every settled burst missed its first step, so the Paroli ladder never reached house-money. A 3-of-10 digit tail misses seven times out of ten; several first-step misses in a row are ordinary variance, not a broken radar. Take a 15-minute break before placing another trade.',
+    bullets: [
+      'Never restart at a higher base stake, a deeper step count, or a lower threshold after a zero-win stop-out.',
+      'After the cooldown, verify the 1HZ feeds are still streaming and run a few Demo bursts before returning to Real.',
+    ],
+    shell: 'border-danger/60',
+    badgeTone: 'bg-danger text-ink',
+    accent: 'text-danger',
+    primary: 'bg-danger text-ink hover:bg-danger/90',
+  },
+};
+
 function formatClock(totalSeconds: number): string {
   const safe = Math.max(0, Math.ceil(totalSeconds));
   const minutes = Math.floor(safe / 60);
@@ -161,13 +209,14 @@ export default function SessionAdvisorModal({
   onReset,
   variant = 'mesh',
 }: Props): ReactElement | null {
-  const duration = state ? CONFIG[state.mode].durationSec : 0;
+  const configForMode = variant === 'straddle' ? STRADDLE_CONFIG : variant === 'paroli' ? PAROLI_CONFIG : CONFIG;
+  const duration = state ? configForMode[state.mode].durationSec : 0;
   const [left, setLeft] = useState(duration);
   const deadlineRef = useRef(0);
 
   useEffect(() => {
     if (!open || !state) return;
-    const total = CONFIG[state.mode].durationSec;
+    const total = configForMode[state.mode].durationSec;
     setLeft(total);
     deadlineRef.current = Date.now() + total * 1000;
     let intervalId = 0;
@@ -179,10 +228,10 @@ export default function SessionAdvisorModal({
     intervalId = window.setInterval(tick, 250);
     tick();
     return () => window.clearInterval(intervalId);
-  }, [open, state?.mode]);
+  }, [configForMode, open, state?.mode]);
 
   if (!open || !state) return null;
-  const config = (variant === 'straddle' ? STRADDLE_CONFIG : CONFIG)[state.mode];
+  const config = configForMode[state.mode];
   const locked = left > 0;
   const signed = (state.pnl >= 0 ? '+' : '-') + '$' + Math.abs(state.pnl).toFixed(2);
   const headline =
@@ -225,10 +274,10 @@ export default function SessionAdvisorModal({
               {state.pnl >= 0 ? '+' : '-'}<Money value={Math.abs(state.pnl)} currency={currency} />
             </span>
           </Stat>
-          <Stat label='Rounds played'>
+          <Stat label={variant === 'paroli' ? 'Bursts settled' : 'Rounds played'}>
             {state.wins + state.losses} <span className='text-[10px] text-muted'>({state.wins} W / {state.losses} L)</span>
           </Stat>
-          <Stat label='Peak martingale'>L{state.peakLevel}</Stat>
+          <Stat label={variant === 'paroli' ? 'Peak Paroli step' : 'Peak martingale'}>L{state.peakLevel}</Stat>
           <Stat label='Session limits'>
             <span className='text-[10px]'>SL {state.stopLoss.toFixed(2)} / TP {state.takeProfit.toFixed(2)}</span>
           </Stat>
@@ -236,7 +285,7 @@ export default function SessionAdvisorModal({
 
         {state.nextBundleCost !== undefined ? (
           <p className='mt-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger'>
-            Headroom guard: no order was sent. The next {variant === 'straddle' ? 'straddle' : 'bundle'} was <Money value={state.nextBundleCost} currency={currency} />. Losing it would breach your active Stop Loss, so the bot stopped before risking more capital.
+            Headroom guard: no order was sent. The next {variant === 'straddle' ? 'straddle' : variant === 'paroli' ? 'burst' : 'bundle'} was <Money value={state.nextBundleCost} currency={currency} />. Losing it would breach your active Stop Loss, so the bot stopped before risking more capital.
           </p>
         ) : null}
 
@@ -251,7 +300,7 @@ export default function SessionAdvisorModal({
             </p>
           </div>
           <p className='mt-2 text-[10px] leading-relaxed text-muted'>
-            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the {variant === 'straddle' ? 'barrier channel' : 'mesh'} and history without arming another trade.
+            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the {variant === 'straddle' ? 'barrier channel' : variant === 'paroli' ? 'radar pool' : 'mesh'} and history without arming another trade.
           </p>
         </div>
 
