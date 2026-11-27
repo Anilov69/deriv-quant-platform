@@ -21,6 +21,8 @@ interface Props {
   currency: string;
   onDismiss: () => void;
   onReset: () => void;
+  /** Optional copy variant. The mesh page keeps the original wording by default. */
+  variant?: 'mesh' | 'straddle';
 }
 
 interface AdvisorConfig {
@@ -83,6 +85,54 @@ const CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
   },
 };
 
+const STRADDLE_CONFIG: Record<SessionAdvisorMode, AdvisorConfig> = {
+  TP_HIT: {
+    durationSec: 300,
+    badge: 'TAKE PROFIT HIT',
+    action: 'Stop Trading for 5 Minutes',
+    message:
+      'Your dual one-touch straddle banked a positive variance run and hit Take Profit. A straddle is two independent touch bets: one leg paying does not make the next corridor more likely to touch. Step away for 5 minutes, then restart at the base leg stake rather than trying to force another whipsaw.',
+    bullets: [
+      'Do not widen the barriers or raise the leg stake just because the last round won.',
+      'Review the grouped straddle history or export the CSV while the 5-minute timer cools down.',
+    ],
+    shell: 'border-accent/60',
+    badgeTone: 'bg-accent text-ink',
+    accent: 'text-accent',
+    primary: 'bg-accent text-ink hover:bg-accent/90',
+  },
+  SL_PARTIAL_WINS: {
+    durationSec: 600,
+    badge: 'STOP LOSS — PARTIAL WINS',
+    action: 'Pause Trading for 10 Minutes',
+    message:
+      "Your straddle Stop Loss cut off a quiet-range or one-sided bleed before it could consume another Martingale cycle. Even after earlier touches, long stretches where neither barrier is reached are normal on a random walk. Pause for 10 minutes instead of revenge-firing a wider corridor.",
+    bullets: [
+      'Do not raise the base stake, Max Levels, or barrier width to win it back faster.',
+      'Confirm your remaining wallet still holds at least 3× the 1-cycle straddle Stop Loss before resuming.',
+    ],
+    shell: 'border-amber-400/60',
+    badgeTone: 'bg-amber-400 text-ink',
+    accent: 'text-amber-300',
+    primary: 'bg-amber-400 text-ink hover:bg-amber-300',
+  },
+  SL_ZERO_WINS: {
+    durationSec: 900,
+    badge: 'STOP LOSS — ZERO WINS',
+    action: 'Step Away for 15 Minutes (or Switch to Demo)',
+    message:
+      "You ran from Level 0 through your Martingale cap without a single winning leg. A straddle can lose every round when the market stays inside both barriers; that is variance, not a broken signal. Take a 15-minute break before placing another trade.",
+    bullets: [
+      'Never restart at a higher stake or tighter barrier after a 0-win stop-out.',
+      'After the cooldown, verify contracts_for still offers tick ONETOUCH and run a few Demo rounds before returning to Real.',
+    ],
+    shell: 'border-danger/60',
+    badgeTone: 'bg-danger text-ink',
+    accent: 'text-danger',
+    primary: 'bg-danger text-ink hover:bg-danger/90',
+  },
+};
+
 function formatClock(totalSeconds: number): string {
   const safe = Math.max(0, Math.ceil(totalSeconds));
   const minutes = Math.floor(safe / 60);
@@ -103,7 +153,14 @@ function Stat({ label, children }: { label: string; children: ReactNode }): Reac
   );
 }
 
-export default function SessionAdvisorModal({ open, state, currency, onDismiss, onReset }: Props): ReactElement | null {
+export default function SessionAdvisorModal({
+  open,
+  state,
+  currency,
+  onDismiss,
+  onReset,
+  variant = 'mesh',
+}: Props): ReactElement | null {
   const duration = state ? CONFIG[state.mode].durationSec : 0;
   const [left, setLeft] = useState(duration);
   const deadlineRef = useRef(0);
@@ -125,7 +182,7 @@ export default function SessionAdvisorModal({ open, state, currency, onDismiss, 
   }, [open, state?.mode]);
 
   if (!open || !state) return null;
-  const config = CONFIG[state.mode];
+  const config = (variant === 'straddle' ? STRADDLE_CONFIG : CONFIG)[state.mode];
   const locked = left > 0;
   const signed = (state.pnl >= 0 ? '+' : '-') + '$' + Math.abs(state.pnl).toFixed(2);
   const headline =
@@ -179,7 +236,7 @@ export default function SessionAdvisorModal({ open, state, currency, onDismiss, 
 
         {state.nextBundleCost !== undefined ? (
           <p className='mt-3 rounded border border-danger/40 bg-danger/10 px-3 py-2 text-[11px] leading-relaxed text-danger'>
-            Headroom guard: no order was sent. The next bundle was <Money value={state.nextBundleCost} currency={currency} />. Losing it would breach your active Stop Loss, so the bot stopped before risking more capital.
+            Headroom guard: no order was sent. The next {variant === 'straddle' ? 'straddle' : 'bundle'} was <Money value={state.nextBundleCost} currency={currency} />. Losing it would breach your active Stop Loss, so the bot stopped before risking more capital.
           </p>
         ) : null}
 
@@ -194,7 +251,7 @@ export default function SessionAdvisorModal({ open, state, currency, onDismiss, 
             </p>
           </div>
           <p className='mt-2 text-[10px] leading-relaxed text-muted'>
-            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the mesh and history without arming another trade.
+            The timer starts as soon as the modal opens. Dismissing it keeps the engine stopped and lets you review the {variant === 'straddle' ? 'barrier channel' : 'mesh'} and history without arming another trade.
           </p>
         </div>
 

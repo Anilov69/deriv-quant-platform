@@ -57,6 +57,19 @@ export interface Contract {
   profit: number;
 }
 
+/** A normalized entry from Deriv's contracts_for capability response. */
+export interface ContractOffer {
+  contractType: string;
+  contractCategory: string;
+  minContractDuration: string;
+  maxContractDuration: string;
+  expiryType: string;
+  barrier: string | null;
+  defaultStake: number;
+  pipSize: number;
+  underlyingSymbol: string;
+}
+
 export class DerivError extends Error {
   readonly code: string;
   readonly http: number;
@@ -317,6 +330,26 @@ export class DerivSession {
     symbols.sort((a, b) => a.family.localeCompare(b.family) || a.symbol.localeCompare(b.symbol));
     this.onSymbols?.(symbols);
     return symbols;
+  }
+
+  async contractsFor(symbol: string, currency: string): Promise<ContractOffer[]> {
+    const message = await this.send({ contracts_for: symbol, currency, product_type: "basic" });
+    const rows: unknown[] = Array.isArray(message?.contracts_for?.available) ? message.contracts_for.available : [];
+    return rows.map((row) => {
+      const item = typeof row === "object" && row !== null ? (row as Record<string, unknown>) : {};
+      const barrier = item.barrier === null || item.barrier === undefined ? null : String(item.barrier);
+      return {
+        contractType: String(item.contract_type ?? ""),
+        contractCategory: String(item.contract_category ?? ""),
+        minContractDuration: String(item.min_contract_duration ?? ""),
+        maxContractDuration: String(item.max_contract_duration ?? ""),
+        expiryType: String(item.expiry_type ?? ""),
+        barrier,
+        defaultStake: num(item.default_stake),
+        pipSize: num(item.pip_size),
+        underlyingSymbol: String(item.underlying_symbol ?? symbol),
+      };
+    });
   }
 
   async history(symbol: string, count: number): Promise<Tick[]> {

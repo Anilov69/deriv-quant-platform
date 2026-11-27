@@ -9,6 +9,7 @@ import type { Snapshot } from "@/autotrade";
 import AutoTradePanel from "@/AutoTradePanel";
 import GapEnginePage from "@/pages/GapEnginePage";
 import MeshHedgePage from "@/pages/MeshHedgePage";
+import TouchStraddlePage from "@/pages/TouchStraddlePage";
 import {
   digitsFrom,
   entropyBits,
@@ -33,13 +34,14 @@ interface Notice {
   text: string;
 }
 
-type Route = "home" | "gap" | "mesh";
+type Route = "home" | "gap" | "mesh" | "straddle";
 
 /** GitHub Pages has no server-side routing, so the page lives in the hash. */
 function readRoute(): Route {
   const path = window.location.hash.replace(/^#\/?/, "").split("?")[0];
   if (path === "gap-engine") return "gap";
   if (path === "mesh-hedge") return "mesh";
+  if (path === "touch-straddle") return "straddle";
   return "home";
 }
 
@@ -159,6 +161,7 @@ export default function App(): ReactElement {
   const routeRef = useRef<Route>(route);
   const gapContractRef = useRef<((payload: any) => void) | null>(null);
   const meshContractRef = useRef<((payload: any) => void) | null>(null);
+  const touchContractRef = useRef<((payload: any) => void) | null>(null);
 
   useEffect(() => {
     routeRef.current = route;
@@ -191,6 +194,7 @@ export default function App(): ReactElement {
       autoRef.current?.onContractUpdate(payload);
       gapContractRef.current?.(payload);
       meshContractRef.current?.(payload);
+      touchContractRef.current?.(payload);
       if (routeRef.current !== "home") return;
       const next = toContract(payload);
       setPositions((previous) => {
@@ -238,6 +242,10 @@ export default function App(): ReactElement {
 
   const bindMeshContractListener = useCallback((handler: ((payload: any) => void) | null) => {
     meshContractRef.current = handler;
+  }, []);
+
+  const bindTouchContractListener = useCallback((handler: ((payload: any) => void) | null) => {
+    touchContractRef.current = handler;
   }, []);
 
   const switchAccount = useCallback((next: string) => {
@@ -504,6 +512,9 @@ export default function App(): ReactElement {
           <a href="#/mesh-hedge" className={"rounded px-2 py-1 " + (route === "mesh" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
             Mesh Hedge
           </a>
+          <a href="#/touch-straddle" className={"rounded px-2 py-1 " + (route === "straddle" ? "bg-panel text-slate-100" : "text-muted hover:text-slate-100")}>
+            Touch Straddle
+          </a>
         </nav>
         <div className="flex items-center gap-3 text-xs">
           <span className={"rounded-full border px-3 py-1 " + (live ? "border-accent/40 text-accent" : status === "error" ? "border-danger/40 text-danger" : "border-line text-muted")}>
@@ -612,6 +623,21 @@ export default function App(): ReactElement {
           onAccountChange={switchAccount}
           onNotice={notify}
           bindContractListener={bindMeshContractListener}
+        />
+      ) : route === "straddle" ? (
+        <TouchStraddlePage
+          sessionRef={sessionRef}
+          connected={live}
+          symbols={symbols}
+          accounts={accounts}
+          accountId={accountId}
+          accountKind={accountKind}
+          balance={balance}
+          currency={currency}
+          onConnect={() => setAuthOpen(true)}
+          onAccountChange={switchAccount}
+          onNotice={notify}
+          bindContractListener={bindTouchContractListener}
         />
       ) : (
         <>
