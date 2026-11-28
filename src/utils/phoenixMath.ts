@@ -128,6 +128,19 @@ export function chooseImpulseDirection(spotMove: number, previousSpot: number, s
   return spot > previousSpot ? "LONG" : "SHORT";
 }
 
+export function cleanBarrierOffset(rawBarrier: string | number | null | undefined, decimals: number): number {
+  const parsed = typeof rawBarrier === "number" ? rawBarrier : parseFloat(String(rawBarrier ?? "").replace(/[^0-9.+-]/g, ""));
+  if (!Number.isFinite(parsed)) return 0;
+  const places = Math.max(0, Math.min(8, Math.round(decimals)));
+  return Number(Math.abs(parsed).toFixed(places));
+}
+
+export function formatBarrierOffset(rawBarrier: string | number | null | undefined, decimals: number, upper: boolean): string {
+  const clean = cleanBarrierOffset(rawBarrier, decimals);
+  const places = Math.max(0, Math.min(8, Math.round(decimals)));
+  return (upper ? "+" : "-") + clean.toFixed(places);
+}
+
 export function microPhoenixRequests(
   direction: "LONG" | "SHORT",
   spot: number,
@@ -148,7 +161,9 @@ export function microPhoenixRequests(
     },
     {
       contractType: isLong ? "ONETOUCH" : "ONETOUCH",
-      barrier: round2(shieldOffset) === 0 ? undefined : String(round2(shieldOffset)),
+      barrier: cleanBarrierOffset(shieldOffset, 2) === 0
+        ? undefined
+        : formatBarrierOffset(shieldOffset, 2, shieldOffset >= 0),
       duration: 5,
       durationUnit: "t",
       stake,
@@ -159,15 +174,15 @@ export function microPhoenixRequests(
 
 export function turbinePhoenixRequests(
   direction: "LONG" | "SHORT",
-  koOffset: number,
-  touchOffset: number,
+  koBarrier: string,
+  touchBarrier: string,
   turboStake: number,
   shieldStake = PHOENIX_MIN_STAKE,
 ): PhoenixLegRequest[] {
   return [
     {
       contractType: direction === "LONG" ? "TURBOSLONG" : "TURBOSSHORT",
-      barrier: String(round2(koOffset)),
+      barrier: koBarrier,
       duration: 0,
       durationUnit: "t",
       stake: round2(clamp(turboStake, PHOENIX_MIN_STAKE, 100)),
@@ -175,7 +190,7 @@ export function turbinePhoenixRequests(
     },
     {
       contractType: "ONETOUCH",
-      barrier: String(round2(touchOffset)),
+      barrier: touchBarrier,
       duration: 5,
       durationUnit: "t",
       stake: round2(clamp(shieldStake, PHOENIX_MIN_STAKE, 100)),
@@ -184,18 +199,18 @@ export function turbinePhoenixRequests(
   ];
 }
 
-export function vanillaRequests(stake = 1): PhoenixLegRequest[] {
+export function vanillaRequests(stake = 1, atmBarrier = "+0.0"): PhoenixLegRequest[] {
   const safeStake = round2(clamp(stake, 0.35, 100));
   return [
-    { contractType: "VANILLALONGCALL", barrier: "0", duration: 5, durationUnit: "t", stake: safeStake, label: "ATM VANILLALONGCALL" },
-    { contractType: "VANILLALONGPUT", barrier: "0", duration: 5, durationUnit: "t", stake: safeStake, label: "ATM VANILLALONGPUT" },
+    { contractType: "VANILLALONGCALL", barrier: atmBarrier, duration: 5, durationUnit: "t", stake: safeStake, label: "ATM VANILLALONGCALL" },
+    { contractType: "VANILLALONGPUT", barrier: atmBarrier, duration: 5, durationUnit: "t", stake: safeStake, label: "ATM VANILLALONGPUT" },
   ];
 }
 
-export function rangeBoxRequest(stake: number): PhoenixLegRequest {
+export function rangeBoxRequest(stake: number, barrier = "+0.0"): PhoenixLegRequest {
   return {
     contractType: "NOTOUCH",
-    barrier: "0",
+    barrier,
     duration: 1,
     durationUnit: "t",
     stake: round2(clamp(stake, PHOENIX_MIN_STAKE, 100)),

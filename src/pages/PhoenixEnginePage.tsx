@@ -14,6 +14,8 @@ import {
   autoStopLoss,
   autoTakeProfit,
   chooseImpulseDirection,
+  cleanBarrierOffset,
+  formatBarrierOffset,
   gearRoundRisk,
   microPhoenixRequests,
   phoenixCsv,
@@ -100,6 +102,7 @@ interface CapabilityRow {
   vanillaPut: boolean;
   minContractDuration: string;
   barriers: string[];
+  barrierChoicesByType: Record<string, string[]>;
 }
 
 const inputClass = "w-full rounded border border-line bg-ink px-2 py-1.5 font-mono text-xs text-slate-100 outline-none focus:border-accent disabled:opacity-50";
@@ -418,10 +421,15 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       const offers = await session.contractsFor(symbol);
       if (!aliveRef.current) return;
       const types = new Set(offers.map((offer) => offer.contractType.toUpperCase()));
-      const barriers = offers.flatMap((offer) => [
-        ...(offer.barrier ? [offer.barrier] : []),
-        ...(offer.barrierChoices ?? []),
-      ]).filter((barrier, index, all) => all.indexOf(barrier) === index);
+      const barrierChoicesByType: Record<string, string[]> = {};
+      for (const offer of offers) {
+        const contractType = offer.contractType.toUpperCase();
+        const choices = [...(offer.barrier ? [offer.barrier] : []), ...(offer.barrierChoices ?? [])]
+          .map((choice) => String(choice).trim())
+          .filter((choice) => choice.length > 0);
+        barrierChoicesByType[contractType] = Array.from(new Set([...(barrierChoicesByType[contractType] ?? []), ...choices]));
+      }
+      const barriers = Object.values(barrierChoicesByType).flat().filter((barrier, index, all) => all.indexOf(barrier) === index);
       setCapabilities((previous) => ({
         ...previous,
         [symbol]: {
@@ -438,6 +446,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
           vanillaPut: types.has("VANILLALONGPUT"),
           minContractDuration: offers.find((offer) => offer.minContractDuration)?.minContractDuration ?? "",
           barriers: barriers.sort((a, b) => Math.abs(Number(a)) - Math.abs(Number(b))).slice(0, 20),
+          barrierChoicesByType,
         },
       }));
     } catch (error) {
@@ -457,6 +466,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
           vanillaPut: false,
           minContractDuration: "",
           barriers: [],
+          barrierChoicesByType: {},
         },
       }));
     }
@@ -616,33 +626,90 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     };
   }, [connected, selectedSymbol]);
 
-  const resolveBarrier = useCallback((symbol: string, contractType: "TURBOSLONG" | "TURBOSSHORT" | "ONETOUCH" | "NOTOUCH" | "VANILLA", side: "ko" | "touch" | "atm"): number => {
-    void symbol;
+  const resolveBarrier = useCallback((symbol: string, contractType: "TURBOSLONG" | "TURBOSSHORT" | "ONETOUCH" | "NOTOUCH" | "VANILLA", side: "ko" | "touch" | "atm"): string => {
     const row = capabilities[symbol];
-    const numeric = row?.barriers.map((barrier) => Number(barrier)).filter((barrier) => Number.isFinite(barrier)) ?? [];
+    const choices = row?.barrierChoicesByType[
+      contractType === "VANILLA" ? "VANILLALONGCALL" : contractType
+    ] ?? row?.barriers ?? [];
+    const pip = symbols.find((item) => item.symbol === symbol)?.pip;
+    const decimals = pip && pip > 0
+      ? Math.max(0, Math.min(8, Math.ceil(-Math.log10(pip))))
+      : 2;
+
+    if (side === "atm") {
+      const atm = choices.find((choice) => Number(choice.replace(/[^0-9.-]/g, "")) === 0)
+        ?? choices.find((choice) => choice === "+0.0" || choice === "0.0" || choice === "0")
+        ?? "+0.0";
+      return String(atm).trim();
+    }
+
+    const numericChoices = choices
+      .map((choice) => ({ raw: choice, value: cleanBarrierOffset(choice, decimals) }))
+      .filter((choice) => choice.value > 0)
+      .sort((a, b) => a.value - b.value);
+
     if (side === "ko") {
-      const positive = numeric.filter((barrier) => barrier > 0);
-      return positive.length > 0 ? positive[0] : 0.001;
+      if (numericChoices.length > 0) return formatBarrierOffset(numericChoices[numericChoices.length - 1].raw, decimals, true);
+      return "+0.001";
     }
-    if (side === "touch") {
-      const inside = numeric.filter((barrier) => Math.abs(barrier) > 0 && Math.abs(barrier) < Math.abs(koOffset)).sort((a, b) => Math.abs(a) - Math.abs(b));
-      return inside.length > 0 ? inside[0] : 0.0005;
+
+    const koAbs = Math.abs(koOffset);
+    const inside = numericChoices
+      .filter((choice) => choice.value > 0 && (koAbs <= 0 || choice.value < koAbs))
+      .sort((a, b) => a.value - b.value);
+    if (inside.length > 0) {
+      const desired = inside[Math.floor(inside.length / 2)]?.raw ?? inside[0].raw;
+      return formatBarrierOffset(desired, decimals, true);
     }
-    return 0;
-  }, [capabilities, koOffset]);
+    return "+0.0005";
+  }, [capabilities, koOffset, symbols]);
 
   const placeBundle = useCallback(async (symbol: string, gear: PhoenixGear, requests: PhoenixLegRequest[]): Promise<void> => {
     const session = sessionRef.current;
     if (!session) throw new Error("No Deriv session.");
-    const quotes = await session.quoteBundle(requests.map((request) => ({
-      symbol,
-      contract: request.contractType,
-      barrier: request.barrier,
-      duration: request.duration,
-      durationUnit: request.durationUnit,
-      stake: request.stake,
-      currency: currencyRef.current,
-    })));
+    const payloadRequests = requests.map((request) => {
+      const contractType = request.contractType;
+      const basePayload: {
+        symbol: string;
+        contract: string;
+        duration: number;
+        durationUnit: "t";
+        stake: number;
+        currency: string;
+        barrier?: string;
+        barrier2?: never;
+      } = {
+        symbol,
+        contract: contractType,
+        duration: request.duration,
+        durationUnit: "t",
+        stake: request.stake,
+        currency: currencyRef.current,
+      };
+
+      delete (basePayload as { barrier2?: never }).barrier2;
+
+      if (contractType === "CALL" || contractType === "PUT") {
+        delete (basePayload as { barrier?: string }).barrier;
+        return basePayload;
+      }
+
+      if (typeof request.barrier !== "string" || request.barrier.trim().length === 0) {
+        throw new Error(contractType + ": pre-flight barrier is missing");
+      }
+      basePayload.barrier = request.barrier.trim();
+      return basePayload;
+    });
+
+    let quotes;
+    try {
+      quotes = await session.quoteBundle(payloadRequests);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const failedRequest = payloadRequests.find((request) => request.contract !== "CALL" && request.contract !== "PUT") ?? payloadRequests[0];
+      const failedBarrier = typeof failedRequest?.barrier === "string" ? failedRequest.barrier : "<none>";
+      throw new Error(failedRequest.contract + " (" + failedBarrier + "): " + detail);
+    }
     const ids = await Promise.all(quotes.map((quote, index) => session.buy(quote.id, quote.ask).then((contractId) => {
       activePhoenixIdsRef.current.add(contractId);
       const request = requests[index];
@@ -702,22 +769,29 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     try {
       if (gear === 1) {
         const requests = microPhoenixRequests(direction, spot, baseRef.current, touchOffset);
+        const exactTouchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch");
+        const shield = requests[1];
+        if (shield) shield.barrier = exactTouchBarrier;
         setPhase("Gear 1 · buying CALL/PUT impulse + opposite-side interior shield");
         await placeBundle(symbol, gear, requests);
       } else if (gear === 2) {
-        const ko = resolveBarrier(symbol, "TURBOSLONG", "ko");
-        const touch = resolveBarrier(symbol, "ONETOUCH", "touch");
-        setKoOffset(ko);
-        setTouchOffset(touch);
-        const requests = turbinePhoenixRequests(direction, ko, touch, turboRef.current, PHOENIX_MIN_STAKE);
+        const koBarrier = resolveBarrier(symbol, "TURBOSLONG", "ko");
+        const touchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch");
+        const ko = cleanBarrierOffset(koBarrier, 2);
+        const touch = cleanBarrierOffset(touchBarrier, 2);
+        setKoOffset(ko * (koBarrier.trim().startsWith("-") ? -1 : 1));
+        setTouchOffset(touch * (touchBarrier.trim().startsWith("-") ? -1 : 1));
+        const requests = turbinePhoenixRequests(direction, koBarrier, touchBarrier, turboRef.current, PHOENIX_MIN_STAKE);
         setPhase(dangerShieldRef.current ? "Gear 2 · Turbo-only T0; interior shield waits for danger pullback" : "Gear 2 · buying Turbo + interior ONETOUCH simultaneously");
         await placeBundle(symbol, gear, dangerShieldRef.current ? [requests[0]] : requests);
       } else if (gear === 3) {
         setPhase("Gear 3 · buying ATM Vanilla call + put simultaneously");
-        await placeBundle(symbol, gear, vanillaRequests(1));
+        const atmBarrier = resolveBarrier(symbol, "VANILLA", "atm");
+        await placeBundle(symbol, gear, vanillaRequests(1, atmBarrier));
       } else {
         setPhase("Gear 4 · buying minimum-duration NOTOUCH range box");
-        await placeBundle(symbol, gear, [rangeBoxRequest(baseRef.current)]);
+        const noTouchBarrier = resolveBarrier(symbol, "NOTOUCH", "touch");
+        await placeBundle(symbol, gear, [rangeBoxRequest(baseRef.current, noTouchBarrier)]);
       }
     } catch (error) {
       if (activePhoenixIdsRef.current.size > 0) {
