@@ -31,14 +31,14 @@ export default function ChronoCorridorVisualizer({ geometry, active, armed }: Pr
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h2 className="text-sm font-semibold tracking-tight">Live Chrono Corridor</h2>
-          <p className="text-[10px] text-muted">Reset / Asian entry, rolling mean and protected house-money vault.</p>
+          <p className="text-[10px] text-muted">Asymmetric staggered corridor / virtual probe / 5% ACCU profit split.</p>
         </div>
         <span className={"rounded-full border px-2 py-0.5 text-[9px] font-bold uppercase tracking-widest " + (active ? "border-emerald-400/50 bg-emerald-400/10 text-emerald-300" : "border-line bg-ink/60 text-muted")}>{active ? "Round live" : "Standby"}</span>
       </div>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_310px]">
         <div className="overflow-hidden rounded border border-line bg-ink/50">
-          <svg viewBox="0 0 600 210" role="img" aria-label="Chrono-Asian reset corridor" className="h-auto w-full min-w-[280px]">
+          <svg viewBox="0 0 600 210" role="img" aria-label="Asymmetric Chrono corridor" className="h-auto w-full min-w-[280px]">
             <rect x="40" y="25" width="520" height="145" rx="8" fill="#0b1220" stroke="#1e293b" />
             {doubleWin ? <rect x={Math.max(40, lowX)} y="25" width={Math.max(12, Math.min(520, highX - lowX))} height="145" rx="6" fill="#10b981" fillOpacity="0.14" /> : null}
             <line x1={entryX} y1="25" x2={entryX} y2="170" stroke="#38bdf8" strokeWidth="2" />

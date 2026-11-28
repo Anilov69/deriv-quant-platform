@@ -1,15 +1,25 @@
-export type ChronoWeaponMode = "auto_both" | "asian_impulse_only" | "reset_warp_only";
+export type ChronoWeaponMode = "asymmetric_corridor" | "virtual_probe";
 export type ChronoDirection = "bullish" | "bearish" | "neutral";
 export type ChronoTier = 1 | 2;
-export type ChronoWeapon = "RESETCALL+PUT" | "RESETPUT+CALL" | "CALL+ASIAND" | "PUT+ASIANU" | "ACCU 5% CANNON" | "ASIANU/ASIAND PAROLI";
+export type ChronoWeapon =
+  | "STAGGERED ANCHOR"
+  | "VIRTUAL PROBE"
+  | "ACCU 5% CANNON";
 export type ChronoOutcome =
-  | "DOUBLE-WIN CORRIDOR"
-  | "MICRO-SCRATCH"
-  | "VAULT CANNON HIT"
-  | "CORRIDOR MISS";
+  | "STAGGERED DOUBLE-WIN"
+  | "TREND-LOCKED GREEN"
+  | "REVERSAL SCRATCH"
+  | "T2 EARLY CUT"
+  | "SOLO ANCHOR WIN"
+  | "SOLO ANCHOR MISS"
+  | "VIRTUAL SNAP DOUBLE-WIN"
+  | "CALM DRIFT SCRATCH"
+  | "BREAKOUT MISS"
+  | "ACCU CANNON HIT"
+  | "ACCU KNOCKOUT (PROFIT LOCKED)";
 
 export interface ChronoLegRequest {
-  contractType: "RESETCALL" | "RESETPUT" | "CALL" | "PUT" | "ASIAND" | "ASIANU" | "ACCU";
+  contractType: "CALL" | "PUT" | "NOTOUCH" | "ONETOUCH" | "ACCU";
   stake: number;
   duration?: number;
   durationUnit?: "t";
@@ -66,9 +76,9 @@ export const CHRONO_SYMBOLS = [
 ] as const;
 
 export const CHRONO_MIN_STAKE = 0.35;
-export const CHRONO_MIN_ACCUMULATOR_STAKE = 1;
-export const CHRONO_DEFAULT_VAULT_THRESHOLD = 1.05;
-export const CHRONO_DEFAULT_ACCU_TICKS = 12;
+export const CHRONO_MIN_ACCUMULATOR_STAKE = 0.35;
+export const CHRONO_DEFAULT_VAULT_THRESHOLD = 0.36;
+export const CHRONO_DEFAULT_ACCU_TICKS = 15;
 export const CHRONO_DEFAULT_GROWTH_RATE = 0.05;
 
 export function round2(value: number): number {
@@ -131,106 +141,72 @@ export function analyzeMicrostructure(quotes: readonly number[]): Microstructure
 export function chooseChronoWeapon(
   mode: ChronoWeaponMode,
   signal: MicrostructureSignal,
-  resetTickSupported: boolean,
 ): ChronoDecision {
-  const absoluteSnap = Math.abs(signal.snapMove);
-  const absoluteMomentum = Math.abs(signal.momentumMove);
   const impulseExpansion = signal.atr100 > 0 && signal.atr15 >= signal.atr100 * 0.90;
-  const impulseEligible = impulseExpansion && signal.efficiencyRatio >= 0.65 && absoluteMomentum >= signal.atr15 * 1.55;
-  if (mode === "asian_impulse_only") {
-    const eligible = impulseEligible;
-    if (!eligible) return { weapon: null, direction: "neutral", reason: "Impulse filter not met" };
-    return signal.direction === "bullish"
-      ? { weapon: "CALL+ASIAND", direction: "bullish", reason: "Bullish clean momentum burst" }
-      : signal.direction === "bearish"
-        ? { weapon: "PUT+ASIANU", direction: "bearish", reason: "Bearish clean momentum burst" }
-        : { weapon: null, direction: "neutral", reason: "Neutral impulse" };
+  if (mode === "asymmetric_corridor") {
+    const eligible = impulseExpansion
+      && signal.efficiencyRatio >= 0.62
+      && Math.abs(signal.momentumMove) >= signal.atr15 * 1.35;
+    if (!eligible) return { weapon: null, direction: "neutral", reason: "Waiting for 1.35x ATR asymmetric anchor" };
+    const direction = signal.direction;
+    return {
+      weapon: "STAGGERED ANCHOR",
+      direction,
+      reason: direction === "bullish" ? "Bullish 3-tick impulse · CALL anchor" : direction === "bearish" ? "Bearish 3-tick impulse · PUT anchor" : "Neutral impulse",
+    };
   }
-  if (mode === "reset_warp_only") {
-    if (!resetTickSupported) return { weapon: null, direction: "neutral", reason: "Reset ticks unavailable" };
-    const eligible = absoluteSnap >= 1.6 * signal.atr15;
-    if (!eligible) return { weapon: null, direction: "neutral", reason: "Exhaustion snap not met" };
-    return signal.direction === "bearish"
-      ? { weapon: "RESETCALL+PUT", direction: "bullish", reason: "Sharp drop exhaustion snap" }
-      : signal.direction === "bullish"
-        ? { weapon: "RESETPUT+CALL", direction: "bearish", reason: "Sharp spike exhaustion snap" }
-        : { weapon: null, direction: "neutral", reason: "Neutral snap" };
-  }
-  if (resetTickSupported && absoluteSnap >= 1.6 * signal.atr15) {
-    return signal.direction === "bearish"
-      ? { weapon: "RESETCALL+PUT", direction: "bullish", reason: "Weapon A · bullish reset exhaustion" }
-      : signal.direction === "bullish"
-        ? { weapon: "RESETPUT+CALL", direction: "bearish", reason: "Weapon A · bearish reset exhaustion" }
-        : { weapon: null, direction: "neutral", reason: "Neutral reset snap" };
-  }
-  if (impulseEligible) {
-    return signal.direction === "bullish"
-      ? { weapon: "CALL+ASIAND", direction: "bullish", reason: "Weapon B · bullish momentum burst" }
-      : signal.direction === "bearish"
-        ? { weapon: "PUT+ASIANU", direction: "bearish", reason: "Weapon B · bearish momentum burst" }
-        : { weapon: null, direction: "neutral", reason: "Neutral momentum" };
-  }
-  return { weapon: null, direction: "neutral", reason: "Standing by · no corridor trigger" };
+  const eligible = impulseExpansion
+    && signal.efficiencyRatio >= 0.65
+    && Math.abs(signal.momentumMove) >= signal.atr15 * 1.5;
+  if (!eligible) return { weapon: null, direction: "neutral", reason: "Waiting for 1.50x ATR virtual probe" };
+  return {
+    weapon: "VIRTUAL PROBE",
+    direction: signal.direction,
+    reason: "Virtual probe crossed · 2-leg snap-back corridor",
+  };
 }
 
-export function tier1PairRequests(
-  weapon: "RESETCALL+PUT" | "RESETPUT+CALL" | "CALL+ASIAND" | "PUT+ASIANU",
-  stake: number,
-  resetDuration: number,
-): ChronoLegRequest[] {
-  const safeStake = round2(clamp(stake, CHRONO_MIN_STAKE, 100));
-  if (weapon === "RESETCALL+PUT") {
-    return [
-      { contractType: "RESETCALL", stake: safeStake, duration: resetDuration, durationUnit: "t", label: "RESETCALL midpoint warp" },
-      { contractType: "PUT", stake: safeStake, duration: resetDuration, durationUnit: "t", label: "PUT continued-crash guard" },
-    ];
-  }
-  if (weapon === "RESETPUT+CALL") {
-    return [
-      { contractType: "RESETPUT", stake: safeStake, duration: resetDuration, durationUnit: "t", label: "RESETPUT midpoint warp" },
-      { contractType: "CALL", stake: safeStake, duration: resetDuration, durationUnit: "t", label: "CALL rebound guard" },
-    ];
-  }
-  if (weapon === "CALL+ASIAND") {
-    return [
-      { contractType: "CALL", stake: safeStake, duration: 5, durationUnit: "t", label: "CALL 5 ticks" },
-      { contractType: "ASIAND", stake: safeStake, duration: 5, durationUnit: "t", label: "ASIAND 5 ticks" },
-    ];
-  }
+export function staggeredAnchorRequest(direction: "bullish" | "bearish"): ChronoLegRequest {
+  return {
+    contractType: direction === "bullish" ? "CALL" : "PUT",
+    stake: 0.45,
+    duration: 5,
+    durationUnit: "t",
+    label: (direction === "bullish" ? "CALL" : "PUT") + " $0.45 T=0 anchor",
+  };
+}
+
+export function staggeredTrapRequest(direction: "bullish" | "bearish"): ChronoLegRequest {
+  return {
+    contractType: direction === "bullish" ? "PUT" : "CALL",
+    stake: 0.35,
+    duration: 5,
+    durationUnit: "t",
+    label: (direction === "bullish" ? "PUT" : "CALL") + " $0.35 T=2 peak trap",
+  };
+}
+
+export function virtualProbeRequests(direction: "bullish" | "bearish", notouchBarrier: string, onetouchBarrier: string): ChronoLegRequest[] {
   return [
-    { contractType: "PUT", stake: safeStake, duration: 5, durationUnit: "t", label: "PUT 5 ticks" },
-    { contractType: "ASIANU", stake: safeStake, duration: 5, durationUnit: "t", label: "ASIANU 5 ticks" },
+    { contractType: "NOTOUCH", stake: 0.45, duration: 5, durationUnit: "t", barrier: notouchBarrier, label: "NOTOUCH $0.45 impulse-direction protection" },
+    { contractType: "ONETOUCH", stake: 0.35, duration: 5, durationUnit: "t", barrier: onetouchBarrier, label: "ONETOUCH $0.35 snap-back probe" },
   ];
 }
 
 export function accumulatorRequest(
   cannonStake: number,
   growthRate: number,
-  takeProfitMultiple = 0.85,
+  takeProfitMultiple = 0.38,
 ): ChronoLegRequest {
-  const safeStake = round2(clamp(cannonStake, CHRONO_MIN_ACCUMULATOR_STAKE, 100));
+  const safeStake = round2(clamp(cannonStake || CHRONO_MIN_ACCUMULATOR_STAKE, CHRONO_MIN_ACCUMULATOR_STAKE, 100));
   const safeRate = round2(clamp(growthRate, 0.01, 0.05));
   return {
     contractType: "ACCU",
-    stake: safeStake,
-    growthRate: safeRate,
-    limitTakeProfit: round2(safeStake * takeProfitMultiple),
-    label: "ACCU " + String(Math.round(safeRate * 100)) + "% growth cannon",
+    stake: 0.35,
+    growthRate: 0.05,
+    limitTakeProfit: takeProfitMultiple,
+    label: "ACCU 5% $0.35 house-profit cannon",
   };
-}
-
-export function paroliHouseMoneyRequest(direction: "bullish" | "bearish", reinvestStake: number): ChronoLegRequest[] {
-  const stake = round2(clamp(reinvestStake, CHRONO_MIN_STAKE, 100));
-  if (direction === "bullish") {
-    return [
-      { contractType: "ASIANU", stake, duration: 5, durationUnit: "t", label: "ASIANU house-money Step 1" },
-      { contractType: "ASIAND", stake, duration: 5, durationUnit: "t", label: "ASIAND reinvested Step 2" },
-    ];
-  }
-  return [
-    { contractType: "ASIAND", stake, duration: 5, durationUnit: "t", label: "ASIAND house-money Step 1" },
-    { contractType: "ASIANU", stake, duration: 5, durationUnit: "t", label: "ASIANU reinvested Step 2" },
-  ];
 }
 
 export function chronoAutoStopLoss(): number {

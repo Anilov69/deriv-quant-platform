@@ -21,8 +21,9 @@ import {
   efficiencyRatio,
   rollingAsianMean,
   round2,
-  safeEvenResetDuration,
-  tier1PairRequests,
+  staggeredAnchorRequest,
+  staggeredTrapRequest,
+  virtualProbeRequests,
 } from "@/utils/chronoMath";
 import type {
   ChronoDirection,
@@ -148,7 +149,7 @@ export default function ChronoVaultPage(props: Props): ReactElement {
   const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ75V");
   const [secondarySymbol, setSecondarySymbol] = useState<string>("1HZ100V");
   const [feedTelemetry, setFeedTelemetry] = useState<Record<string, { spot: number; atr15: number; atr100: number; impulseMove: number; efficiency: number }>>({});
-  const [weaponMode, setWeaponMode] = useState<ChronoWeaponMode>("asian_impulse_only");
+  const [weaponMode, setWeaponMode] = useState<ChronoWeaponMode>("asymmetric_corridor");
   const [baseLegStake, setBaseLegStake] = useState(CHRONO_MIN_STAKE);
   const [vaultEnabled, setVaultEnabled] = useState(true);
   const [vaultUnlockThreshold, setVaultUnlockThreshold] = useState(CHRONO_DEFAULT_VAULT_THRESHOLD);
@@ -208,6 +209,13 @@ export default function ChronoVaultPage(props: Props): ReactElement {
   const scanAndFireRef = useRef<(quotes: readonly number[], symbol: string, localAtr15: number, localAtr100: number) => Promise<void>>(async () => undefined);
   const radarSubsRef = useRef<Map<string, string>>(new Map<string, string>());
   const cooldownTimerRef = useRef<number | undefined>(undefined);
+  const virtualS0Ref = useRef<Record<string, number>>({});
+  const anchorSpotRef = useRef<Record<string, number>>({});
+  const anchorDirectionRef = useRef<Record<string, ChronoDirection>>({});
+  const ticksSinceAnchorRef = useRef<Record<string, number>>({});
+  const pendingTrapRef = useRef<Record<string, boolean>>({});
+  const setPendingAccuRef = useRef(false);
+  const pendingAccuSymbolRef = useRef<string | null>(null);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -287,9 +295,11 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     pnlRef.current = round2(pnlRef.current + net);
     setPnl(pnlRef.current);
 
-    if (current.tier === 1 && net > 0) {
-      tier1BankedProfitRef.current = round2(tier1BankedProfitRef.current + net);
+    if (current.tier === 1 && net >= 0.50) {
+      tier1BankedProfitRef.current = round2(tier1BankedProfitRef.current + net * 0.50);
       setTier1BankedProfit(tier1BankedProfitRef.current);
+      setPendingAccuRef.current = true;
+      pendingAccuSymbolRef.current = current.symbol;
     }
 
     setLogs((previous) => [{
@@ -360,12 +370,22 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       if (activeChronoIdsRef.current.size === 0) {
         const net = round2(legs.reduce((sum, leg) => sum + leg.pnl, 0));
         const outcome: ChronoOutcome = current.tier === 2
-          ? "VAULT CANNON HIT"
-          : net > 0
-            ? "DOUBLE-WIN CORRIDOR"
-            : net >= -0.06
-              ? "MICRO-SCRATCH"
-              : "CORRIDOR MISS";
+          ? net >= 0.38
+            ? "ACCU CANNON HIT"
+            : "ACCU KNOCKOUT (PROFIT LOCKED)"
+          : current.weapon === "STAGGERED ANCHOR" && legs.length === 1
+            ? net > 0 ? "SOLO ANCHOR WIN" : "SOLO ANCHOR MISS"
+            : current.weapon === "STAGGERED ANCHOR" && legs.length === 2 && net >= 0.50
+              ? "STAGGERED DOUBLE-WIN"
+              : current.weapon === "STAGGERED ANCHOR" && legs.length === 2 && net > 0
+                ? "TREND-LOCKED GREEN"
+                : current.weapon === "STAGGERED ANCHOR" && legs.length === 2 && net >= -0.20
+                  ? "REVERSAL SCRATCH"
+                  : current.weapon === "VIRTUAL PROBE" && net >= 0.50
+                    ? "VIRTUAL SNAP DOUBLE-WIN"
+                    : current.weapon === "VIRTUAL PROBE" && net >= -0.20
+                      ? "CALM DRIFT SCRATCH"
+                      : "BREAKOUT MISS";
         finalizeRound(outcome);
       }
     }
@@ -390,24 +410,16 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       const offers = await session.contractsFor(symbol);
       if (!aliveRef.current) return;
       const types = new Set(offers.map((offer) => offer.contractType.toUpperCase()));
-      const resetOffers = offers.filter((offer) => {
-        const type = offer.contractType.toUpperCase();
-        return type === "RESETCALL" || type === "RESETPUT";
-      });
-      const resetMinText = resetOffers.find((offer) => /\bticks\b|\btick\b|[0-9]+t/i.test(offer.minContractDuration))?.minContractDuration ?? "";
-      const resetMinMatch = resetMinText.match(/\d+/);
-      const resetMinTicks = resetMinMatch ? Number(resetMinMatch[0]) : 0;
-      const resetTickSupported = resetOffers.length > 0 && resetMinTicks >= 1;
       const capability: ChronoCapability = {
         symbol,
         ready: true,
         error: null,
-        asianUp: types.has("ASIANU"),
-        asianDown: types.has("ASIAND"),
-        resetCall: types.has("RESETCALL"),
-        resetPut: types.has("RESETPUT"),
-        resetTickSupported,
-        resetMinTicks: resetTickSupported ? resetMinTicks : 0,
+        asianUp: types.has("NOTOUCH"),
+        asianDown: types.has("ONETOUCH"),
+        resetCall: types.has("CALL"),
+        resetPut: types.has("PUT"),
+        resetTickSupported: types.has("CALL") && types.has("PUT"),
+        resetMinTicks: 5,
         accumulator: types.has("ACCU"),
         growthRates: [0.01, 0.02, 0.03, 0.04, 0.05],
         minAccumulatorStake: 1,
@@ -547,7 +559,7 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     const quoteRequests = requests.map((request) => {
       const payload: {
         symbol: string;
-        contract: "RESETCALL" | "RESETPUT" | "CALL" | "PUT" | "ASIAND" | "ASIANU" | "ACCU";
+        contract: "CALL" | "PUT" | "NOTOUCH" | "ONETOUCH" | "ACCU";
         duration?: number;
         durationUnit?: "t";
         stake: number;
@@ -582,10 +594,10 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       // Dedicated duration-free ACCU proposal: duration/duration_unit are never serialized.
       const quote = await session.quoteAccumulator({
         symbol,
-        stake: request.stake,
-        currency: currencyRef.current,
-        growthRate: request.growthRate ?? CHRONO_DEFAULT_GROWTH_RATE,
-        takeProfit: request.limitTakeProfit ?? round2(request.stake * 0.85),
+        stake: 0.35,
+        currency: "USD",
+        growthRate: 0.05,
+        takeProfit: 0.38,
       });
       const contractId = await session.buy(quote.id, quote.ask);
       const leg: ChronoLegState = {
@@ -610,23 +622,22 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       return;
     }
 
-    const quotes = await session.quoteBundle(requests.map((request) => ({
-      symbol,
-      contract: request.contractType,
-      stake: request.stake,
-      currency: currencyRef.current,
-      duration: request.duration ?? 5,
-      durationUnit: request.durationUnit ?? "t",
-      barrier: request.barrier,
-    })));
-    const resetIndex = requests.findIndex((request) => request.contractType === "RESETCALL" || request.contractType === "RESETPUT");
-    if (resetIndex >= 0) {
-      const resetRequest = requests[resetIndex];
-      const resetQuote = quotes[resetIndex];
-      if (resetQuote && Number(resetQuote.payout) < resetRequest.stake * 1.75) {
-        throw new Error("RESET_PAYOUT_TOO_LOW: " + Number(resetQuote.payout).toFixed(2) + " / " + (resetRequest.stake * 1.75).toFixed(2));
+    const quotes = await session.quoteBundle(requests.map((request) => {
+      const payload: Record<string, unknown> = {
+        symbol,
+        contract: request.contractType,
+        stake: request.stake,
+        currency: currencyRef.current,
+        duration: request.duration ?? 5,
+        durationUnit: request.durationUnit ?? "t",
+      };
+      if (request.contractType === "CALL" || request.contractType === "PUT") {
+        delete payload.barrier;
+      } else if (typeof request.barrier === "string" && request.barrier.trim()) {
+        payload.barrier = request.barrier.trim();
       }
-    }
+      return payload as never;
+    }));
     const legs = await Promise.all(quotes.map(async (quote, index) => {
       const contractId = await session.buy(quote.id, quote.ask);
       activeChronoIdsRef.current.add(contractId);
@@ -656,21 +667,15 @@ export default function ChronoVaultPage(props: Props): ReactElement {
 
   const scanAndFire = useCallback(async (quotes: readonly number[], symbol: string, localAtr15: number, localAtr100: number): Promise<void> => {
     if (!connectedRef.current || execRef.current || coolingRef.current || roundRef.current || activeChronoIdsRef.current.size > 0) return;
-    const capability = capabilities[symbol];
-    const signal = analyzeMicrostructure(quotes);
-    const resetTickSupported = Boolean(capability?.resetTickSupported && capability.resetCall && capability.resetPut);
-    const decision = chooseChronoWeapon(weaponModeRef.current, signal, resetTickSupported);
 
-    const compression = localAtr100 > 0 ? localAtr15 / localAtr100 : 1;
-    if (vaultEnabledRef.current && tier1BankedProfitRef.current >= vaultThresholdRef.current && compression <= 0.70) {
-      const cannonStake = Math.max(1, round2(tier1BankedProfitRef.current));
-      const request = accumulatorRequest(cannonStake, growthRateRef.current);
+    if (setPendingAccuRef.current && pendingAccuSymbolRef.current && !coolingRef.current) {
+      const request = accumulatorRequest(0.35, 0.05, 0.38);
       const id = ++roundSeqRef.current;
       const current: ChronoRound = {
         id,
-        symbol,
+        symbol: pendingAccuSymbolRef.current,
         tier: 2,
-        weapon: request.growthRate === 0.05 ? "ACCU 5% CANNON" : "ACCU 5% CANNON",
+        weapon: "ACCU 5% CANNON",
         direction: "neutral",
         entryStrike: quotes[quotes.length - 1] ?? 0,
         rollingMean: rollingAsianMean(quotes),
@@ -678,19 +683,61 @@ export default function ChronoVaultPage(props: Props): ReactElement {
         legs: [],
         startAt: Date.now(),
       };
+      setPendingAccuRef.current = false;
+      pendingAccuSymbolRef.current = null;
       roundRef.current = current;
       setRound(current);
       execRef.current = true;
       setExecuting(true);
-      setPhase("Tier 2 · firing ACCU house-money cannon");
+      setPhase("Tier 2 · instant 5% ACCU profit-split cannon");
       try {
-        await placeChronoPair(symbol, 2, request.label.includes("ACCU") ? "ACCU 5% CANNON" : "ACCU 5% CANNON", [request]);
+        await placeChronoPair(symbol, 2, "ACCU 5% CANNON", [request]);
       } catch (error) {
         roundRef.current = null;
         setRound(null);
         execRef.current = false;
         setExecuting(false);
-        onNotice("Vault cannon unavailable: " + (error instanceof Error ? error.message : String(error)), "bad");
+        onNotice("ACCU cannon unavailable: " + (error instanceof Error ? error.message : String(error)), "bad");
+      }
+      return;
+    }
+
+    const signal = analyzeMicrostructure(quotes);
+    const decision = chooseChronoWeapon(weaponModeRef.current, signal);
+
+    if (weaponModeRef.current === "virtual_probe") {
+      if (!virtualS0Ref.current[symbol]) virtualS0Ref.current[symbol] = quotes[quotes.length - 1] ?? 0;
+      const virtualS0 = virtualS0Ref.current[symbol];
+      const currentSpot = quotes[quotes.length - 1] ?? 0;
+      if (Math.abs(currentSpot - virtualS0) >= localAtr15 * 1.5 && decision.weapon === "VIRTUAL PROBE") {
+        const decimals = 3;
+        const pipSize = Math.pow(10, -decimals);
+        const surgeUp = currentSpot > virtualS0;
+        const noTouchOffset = Math.max(pipSize * 20, localAtr15 * 1.5).toFixed(decimals);
+        const oneTouchOffset = Math.max(pipSize * 20, localAtr15 * 1.4).toFixed(decimals);
+        const requests = virtualProbeRequests(surgeUp ? "bullish" : "bearish", (surgeUp ? "+" : "-") + noTouchOffset, (surgeUp ? "-" : "+") + oneTouchOffset);
+        const id = ++roundSeqRef.current;
+        const current: ChronoRound = {
+          id, symbol, tier: 1, weapon: "VIRTUAL PROBE", direction: surgeUp ? "bullish" : "bearish",
+          entryStrike: virtualS0, rollingMean: rollingAsianMean(quotes), resetTarget: null, legs: [], startAt: Date.now(),
+        };
+        roundRef.current = current;
+        setRound(current);
+        execRef.current = true;
+        setExecuting(true);
+        setPhase("Mode B · virtual probe snap-back corridor");
+        try {
+          await placeChronoPair(symbol, 1, "VIRTUAL PROBE", requests);
+          virtualS0Ref.current[symbol] = currentSpot;
+        } catch (error) {
+          roundRef.current = null;
+          setRound(null);
+          execRef.current = false;
+          setExecuting(false);
+          onNotice("Virtual probe could not be placed: " + (error instanceof Error ? error.message : String(error)), "bad");
+        }
+      } else {
+        setPhase(decision.reason);
       }
       return;
     }
@@ -700,50 +747,66 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       return;
     }
 
-    const weapon = decision.weapon;
-    if (!resetTickSupported && (weapon === "RESETCALL+PUT" || weapon === "RESETPUT+CALL")) {
-      setPhase("Reset ticks unavailable · Tier 1 Weapon B only");
+    const existingAnchor = anchorSpotRef.current[symbol];
+    if (!existingAnchor) {
+      const direction = decision.direction;
+      if (direction !== "bullish" && direction !== "bearish") return;
+      anchorSpotRef.current[symbol] = quotes[quotes.length - 1] ?? 0;
+      anchorDirectionRef.current[symbol] = direction;
+      ticksSinceAnchorRef.current[symbol] = 0;
+      pendingTrapRef.current[symbol] = false;
+      const request = staggeredAnchorRequest(direction);
+      const id = ++roundSeqRef.current;
+      const entry = anchorSpotRef.current[symbol];
+      const current: ChronoRound = {
+        id, symbol, tier: 1, weapon: "STAGGERED ANCHOR", direction,
+        entryStrike: entry, rollingMean: rollingAsianMean(quotes), resetTarget: null, legs: [], startAt: Date.now(),
+      };
+      roundRef.current = current;
+      setRound(current);
+      execRef.current = true;
+      setExecuting(true);
+      setPhase("Mode A · T=0 $0.45 directional anchor");
+      try {
+        await placeChronoPair(symbol, 1, "STAGGERED ANCHOR", [request]);
+      } catch (error) {
+        anchorSpotRef.current[symbol] = 0;
+        roundRef.current = null;
+        setRound(null);
+        execRef.current = false;
+        setExecuting(false);
+        onNotice("Staggered anchor could not be placed: " + (error instanceof Error ? error.message : String(error)), "bad");
+      }
       return;
     }
-    const resetDuration = safeEvenResetDuration(capability?.resetMinTicks ?? 6);
-    const requests = tier1PairRequests(weapon as "RESETCALL+PUT" | "RESETPUT+CALL" | "CALL+ASIAND" | "PUT+ASIANU", baseStakeRef.current, resetDuration);
-    const id = ++roundSeqRef.current;
-    const entry = quotes[quotes.length - 1] ?? 0;
-    const mean = rollingAsianMean(quotes);
-    const current: ChronoRound = {
-      id,
-      symbol,
-      tier: 1,
-      weapon,
-      direction: decision.direction,
-      entryStrike: entry,
-      rollingMean: mean,
-      resetTarget: weapon === "RESETCALL+PUT" || weapon === "RESETPUT+CALL" ? rollingAsianMean(quotes.slice(-3)) : null,
-      legs: [],
-      startAt: Date.now(),
-    };
-    entryStrike !== entry && setEntryStrike(entry);
-    setResetTarget(current.resetTarget);
-    roundRef.current = current;
-    setRound(current);
-    execRef.current = true;
-    setExecuting(true);
-    setPhase("Tier 1 · " + decision.reason);
-    try {
-      await placeChronoPair(symbol, 1, weapon, requests);
-    } catch (error) {
-      roundRef.current = null;
-      setRound(null);
-      execRef.current = false;
-      setExecuting(false);
-      const message = error instanceof DerivError ? error.message : String(error);
-      if (message.includes("RESET_PAYOUT_TOO_LOW")) {
-        setPhase("RESET PAYOUT TOO LOW (<1.75x) · reset trade skipped");
-      } else {
-        onNotice("Chrono pair could not be placed: " + message, "bad");
+
+    ticksSinceAnchorRef.current[symbol] = (ticksSinceAnchorRef.current[symbol] ?? 0) + 1;
+    if (ticksSinceAnchorRef.current[symbol] !== 2 || pendingTrapRef.current[symbol]) return;
+    const anchorSpot = anchorSpotRef.current[symbol];
+    const direction = anchorDirectionRef.current[symbol];
+    const currentSpot = quotes[quotes.length - 1] ?? 0;
+    const signedMove = direction === "bullish" ? currentSpot - anchorSpot : anchorSpot - currentSpot;
+    if (signedMove >= localAtr15 * 1.2) {
+      pendingTrapRef.current[symbol] = true;
+      const request = staggeredTrapRequest(direction === "bullish" ? "bullish" : "bearish");
+      setPhase("Mode A · T=2 $0.35 peak trap armed");
+      try {
+        await placeChronoPair(symbol, 1, "STAGGERED ANCHOR", [request]);
+      } catch (error) {
+        pendingTrapRef.current[symbol] = false;
+        onNotice("Peak trap could not be placed: " + (error instanceof Error ? error.message : String(error)), "bad");
       }
+    } else if (signedMove <= -localAtr15 * 0.8) {
+      const currentRound: ChronoRound | null = roundRef.current as ChronoRound | null;
+      const leg1 = currentRound && Array.isArray(currentRound.legs) ? currentRound.legs[0] : undefined;
+      if (leg1) {
+        sellContract(leg1.contractId);
+        setPhase("T2 EARLY CUT · adverse 0.8x ATR drop");
+      }
+    } else {
+      setPhase("Mode A · neutral drift · anchor runs solo");
     }
-  }, [capabilities, onNotice, placeChronoPair]);
+  }, [onNotice, placeChronoPair, sellContract]);
 
   useEffect(() => {
     scanAndFireRef.current = scanAndFire;
@@ -852,7 +915,7 @@ export default function ChronoVaultPage(props: Props): ReactElement {
                   return (
                     <div key={symbol} className="flex items-center justify-between gap-2 rounded border border-line bg-ink/50 px-2 py-1.5">
                       <div><p className="text-[8px] uppercase tracking-widest text-muted">{index === 0 ? "Primary" : "Secondary"} · {symbol}</p><p className="mt-0.5 font-mono text-[9px] text-slate-300">{metric ? "ATR15 " + metric.atr15.toFixed(5) + " / ATR100 " + metric.atr100.toFixed(5) + " · ER3 " + metric.efficiency.toFixed(2) : "Warming feed…"}</p></div>
-                      <span className={"rounded border px-1.5 py-0.5 text-[8px] font-semibold " + (ready ? "border-emerald-400/40 text-emerald-300" : "border-amber-400/40 text-amber-200")}>{ready ? "IMPULSE READY" : "WAITING · 1.55x ATR"}</span>
+                      <span className={"rounded border px-1.5 py-0.5 text-[8px] font-semibold " + (ready ? "border-emerald-400/40 text-emerald-300" : "border-amber-400/40 text-amber-200")}>{ready ? "IMPULSE READY" : "WAITING · 1.35x/1.50x ATR"}</span>
                     </div>
                   );
                 })}
@@ -868,24 +931,19 @@ export default function ChronoVaultPage(props: Props): ReactElement {
                 <Field label="Secondary radar"><select value={secondarySymbol} onChange={(event) => setSecondarySymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}><option value="NONE">NONE</option>{CHRONO_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}</select></Field>
               </div>
               <div className="mt-2">
-                <p className="text-[9px] uppercase tracking-widest text-muted">Weapon mode</p>
-                <div className="mt-1 grid grid-cols-1 gap-1 rounded border border-line bg-ink/60 p-1">
-                  {(["auto_both", "asian_impulse_only", "reset_warp_only"] as const).map((mode) => (
-                    <button key={mode} type="button" onClick={() => setWeaponMode(mode)} disabled={executing || round !== null} className={"rounded px-2 py-1.5 text-[9px] font-semibold disabled:opacity-50 " + (weaponMode === mode ? "bg-accent text-ink" : "text-muted hover:text-slate-100")}>{mode === "auto_both" ? "Auto Both" : mode === "asian_impulse_only" ? "Asian Impulse Only" : "Reset Warp Only"}</button>
-                  ))}
+                <p className="text-[9px] uppercase tracking-widest text-muted">Corridor mode</p>
+                <div className="mt-1 grid grid-cols-2 gap-1 rounded border border-line bg-ink/60 p-1">
+                  <button type="button" onClick={() => setWeaponMode("asymmetric_corridor")} disabled={executing || round !== null} className={"rounded px-2 py-1.5 text-[9px] font-semibold disabled:opacity-50 " + (weaponMode === "asymmetric_corridor" ? "bg-accent text-ink" : "text-muted hover:text-slate-100")}>Mode A · Staggered</button>
+                  <button type="button" onClick={() => setWeaponMode("virtual_probe")} disabled={executing || round !== null} className={"rounded px-2 py-1.5 text-[9px] font-semibold disabled:opacity-50 " + (weaponMode === "virtual_probe" ? "bg-accent text-ink" : "text-muted hover:text-slate-100")}>Mode B · Virtual Probe</button>
                 </div>
               </div>
-              <div className="mt-2 grid grid-cols-2 gap-2">
-                <Field label="Base leg stake"><input type="number" min={CHRONO_MIN_STAKE} step={0.01} value={baseLegStake} disabled={executing || round !== null} onChange={(event) => setBaseLegStake(Math.max(CHRONO_MIN_STAKE, Number(event.target.value) || CHRONO_MIN_STAKE))} className={inputClass} /></Field>
-                <Field label="Vault unlock"><input type="number" min={0.35} step={0.05} value={vaultUnlockThreshold} disabled={executing || round !== null} onChange={(event) => setVaultUnlockThreshold(Math.max(0.35, Number(event.target.value) || CHRONO_DEFAULT_VAULT_THRESHOLD))} className={inputClass} /></Field>
+              <div className="mt-2 grid grid-cols-3 gap-2 rounded border border-line bg-ink/50 p-2">
+                <Field label="Mode A anchor"><input value="$0.45" readOnly className={inputClass} /></Field>
+                <Field label="Mode A trap"><input value="$0.35" readOnly className={inputClass} /></Field>
+                <Field label="ACCU cannon"><input value="5% · $0.35" readOnly className={inputClass} /></Field>
               </div>
-              <div className="mt-2 flex items-center justify-between rounded border border-line bg-ink/50 p-2">
-                <div><p className="text-[10px] font-semibold text-slate-200">House-money vault</p><p className="text-[9px] text-muted">Protected principal $13 — no touch before armed.</p></div>
-                <button type="button" onClick={() => setVaultEnabled((value) => !value)} disabled={executing || round !== null} className={"rounded border px-2 py-1 text-[9px] font-semibold " + (vaultEnabled ? "border-emerald-400/50 text-emerald-300" : "border-line text-muted")}>{vaultEnabled ? "ON" : "OFF"}</button>
-              </div>
-              <div className="mt-2 grid grid-cols-2 gap-2 rounded border border-line bg-ink/50 p-2">
-                <Field label="ACCU growth"><select value={growthRate} disabled={executing || round !== null} onChange={(event) => setGrowthRate(Number(event.target.value))} className={inputClass}>{[0.01, 0.02, 0.03, 0.04, 0.05].map((rate) => <option key={rate} value={rate}>{Math.round(rate * 100)}%</option>)}</select></Field>
-                <Field label="Target ACCU ticks"><input type="number" min={5} max={100} step={1} value={targetAccuTicks} disabled={executing || round !== null} onChange={(event) => setTargetAccuTicks(Math.max(5, Math.min(100, Number(event.target.value) || CHRONO_DEFAULT_ACCU_TICKS)))} className={inputClass} /></Field>
+              <div className="mt-2 rounded border border-emerald-400/30 bg-emerald-400/5 p-2 text-[9px] leading-relaxed text-muted">
+                50% of every Tier-1 net win ≥ $0.50 is locked permanently. Only the remaining house profit may fund a $0.35 ACCU 5% round.
               </div>
               <div className="mt-3 flex gap-2">
                 <button type="button" onClick={toggleArmed} disabled={!connected || executing || round !== null || cooling} className={"flex-1 rounded px-3 py-2 text-xs font-bold disabled:opacity-40 " + (armed ? "border border-amber-400/50 bg-amber-400/10 text-amber-200" : "border border-accent bg-accent text-ink")}>{connected ? (armed ? "Pause Vault" : "Arm Vault") : "Connect"}</button>
