@@ -123,8 +123,8 @@ export function analyzeMicrostructure(quotes: readonly number[]): Microstructure
   const er = efficiencyRatio(recent3);
   const er4 = efficiencyRatio(recent4);
   let direction: ChronoDirection = "neutral";
-  if (momentumMove4 > 0) direction = "bullish";
-  else if (momentumMove4 < 0) direction = "bearish";
+  if (momentumMove > 0) direction = "bullish";
+  else if (momentumMove < 0) direction = "bearish";
   return { direction, snapMove, momentumMove, efficiencyRatio: er, momentumMove4, efficiencyRatio4: er4, atr15, atr100 };
 }
 
@@ -134,9 +134,9 @@ export function chooseChronoWeapon(
   resetTickSupported: boolean,
 ): ChronoDecision {
   const absoluteSnap = Math.abs(signal.snapMove);
-  const absoluteMomentum = Math.abs(signal.momentumMove4);
-  const impulseExpansion = signal.atr100 > 0 && signal.atr15 >= signal.atr100 * 1.10;
-  const impulseEligible = impulseExpansion && signal.efficiencyRatio4 >= 0.78 && absoluteMomentum >= signal.atr15 * 2.4;
+  const absoluteMomentum = Math.abs(signal.momentumMove);
+  const impulseExpansion = signal.atr100 > 0 && signal.atr15 >= signal.atr100 * 0.90;
+  const impulseEligible = impulseExpansion && signal.efficiencyRatio >= 0.65 && absoluteMomentum >= signal.atr15 * 1.55;
   if (mode === "asian_impulse_only") {
     const eligible = impulseEligible;
     if (!eligible) return { weapon: null, direction: "neutral", reason: "Impulse filter not met" };

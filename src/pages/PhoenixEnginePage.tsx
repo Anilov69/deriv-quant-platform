@@ -17,6 +17,7 @@ import {
   decimalsFromLatestQuote,
   formatBarrierOffset,
   phoenixEntryGate,
+  parsePhoenixDuration,
   pipSizeFromDecimals,
   syntheticTouchOffset,
   gearRoundRisk,
@@ -91,6 +92,14 @@ interface PhoenixRound {
   dangerShieldSent: boolean;
 }
 
+interface PhoenixFeedMetrics {
+  quotes: number[];
+  spot: number;
+  atr15: number;
+  atr100: number;
+  decimals: number;
+}
+
 interface CapabilityRow {
   symbol: string;
   ready: boolean;
@@ -106,6 +115,8 @@ interface CapabilityRow {
   minContractDuration: string;
   barriers: string[];
   barrierChoicesByType: Record<string, string[]>;
+  minStakeByType: Record<string, number>;
+  minDurationByType: Record<string, string>;
 }
 
 const inputClass = "w-full rounded border border-line bg-ink px-2 py-1.5 font-mono text-xs text-slate-100 outline-none focus:border-accent disabled:opacity-50";
@@ -130,6 +141,13 @@ function asContract(raw: unknown): ContractPayload {
 function numberFrom(value: unknown): number {
   const valueNumber = Number(value);
   return Number.isFinite(valueNumber) ? valueNumber : 0;
+}
+
+function rangeAtr(quotes: readonly number[]): number {
+  if (quotes.length < 2) return 0;
+  let sum = 0;
+  for (let index = 1; index < quotes.length; index += 1) sum += Math.abs(quotes[index] - quotes[index - 1]);
+  return sum / (quotes.length - 1);
 }
 
 function signedMoney(value: number, currency: string): string {
@@ -178,7 +196,10 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const [pnl, setPnl] = useState(0);
   const [phase, setPhase] = useState("Warming the Phoenix market console.");
   const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ75V");
+  const [secondarySymbol, setSecondarySymbol] = useState<string>("1HZ100V");
+  const [feedTelemetry, setFeedTelemetry] = useState<Record<string, PhoenixFeedMetrics>>({});
   const [capabilities, setCapabilities] = useState<Record<string, CapabilityRow>>({});
+  const [minimumStakeBySymbol, setMinimumStakeBySymbol] = useState<Record<string, { turbo: number; vanilla: number }>>({});
   const [history, setHistory] = useState<Tick[]>([]);
   const [warmBufferStatus, setWarmBufferStatus] = useState<string | null>(null);
   const [spot, setSpot] = useState<number>(0);
@@ -197,6 +218,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const accountIdRef = useRef(accountId);
   const currencyRef = useRef(currency);
   const selectedRef = useRef(selectedSymbol);
+  const secondaryRef = useRef(secondarySymbol);
   const baseRef = useRef(baseStake);
   const turboRef = useRef(turboStake);
   const primaryGearRef = useRef(primaryGear);
@@ -216,17 +238,31 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const activePhoenixIdsRef = useRef<Set<number>>(new Set<number>());
   const peakBidRef = useRef<Map<number, number>>(new Map<number, number>());
   const validatedTouchOffsetRef = useRef<Record<string, number>>({});
+  const discoveredTurboMinStakeRef = useRef<Record<string, number>>({});
+  const discoveredVanillaMinStakeRef = useRef<Record<string, number>>({});
   const buyPriceRef = useRef<Map<number, number>>(new Map<number, number>());
   const sellSentRef = useRef<Set<number>>(new Set<number>());
   const ticksRef = useRef<Tick[]>([]);
+  const ticksBySymbolRef = useRef<Record<string, Tick[]>>({});
   const tickCacheRef = useRef<Record<string, number[]>>({});
+  const feedMetricsRef = useRef<Record<string, PhoenixFeedMetrics>>({});
+  const capabilityCacheRef = useRef<Record<string, CapabilityRow>>({});
   const radarSubsRef = useRef<Map<string, string>>(new Map<string, string>());
   const reqIdCounterRef = useRef(0);
   const cooldownTimerRef = useRef<number | undefined>(undefined);
   const gearRef = useRef<PhoenixGear>(1);
   const runDecisionRef = useRef({ gear: 1 as PhoenixGear, reason: "Warming", reachable: false });
-  const fireRoundRef = useRef<(direction: "LONG" | "SHORT") => void>(() => undefined);
+  const fireRoundRef = useRef<(direction: "LONG" | "SHORT", symbol: string) => void>(() => undefined);
+  const resolveBarrierRef = useRef<(
+    symbol: string,
+    contractType: "TURBOSLONG" | "TURBOSSHORT" | "ONETOUCH" | "NOTOUCH" | "VANILLA" | "VANILLALONGCALL" | "VANILLALONGPUT",
+    side: "ko" | "touch" | "atm",
+    spotValue?: number,
+    atr15Value?: number,
+  ) => string>(() => "+0.01");
   const touchOffsetRef = useRef(0);
+  const koOffsetRef = useRef(0);
+  const placeBundleRef = useRef<(symbol: string, gear: PhoenixGear, requests: PhoenixLegRequest[]) => Promise<void>>(async () => undefined);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -243,6 +279,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     accountIdRef.current = accountId;
     currencyRef.current = currency;
     selectedRef.current = selectedSymbol;
+    secondaryRef.current = secondarySymbol;
     baseRef.current = baseStake;
     turboRef.current = turboStake;
     primaryGearRef.current = primaryGear;
@@ -254,7 +291,8 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     stopLossRef.current = stopLoss;
     takeProfitRef.current = takeProfit;
     touchOffsetRef.current = touchOffset;
-  }, [accountId, autoRouter, baseStake, connected, currency, dangerShield, dangerTriggerPct, primaryGear, selectedSymbol, stagnationTicks, stopLoss, takeProfit, touchOffset, trailingLock, turboStake]);
+    koOffsetRef.current = koOffset;
+  }, [accountId, autoRouter, baseStake, connected, currency, dangerShield, dangerTriggerPct, koOffset, primaryGear, secondarySymbol, selectedSymbol, stagnationTicks, stopLoss, takeProfit, touchOffset, trailingLock, turboStake]);
 
   useEffect(() => {
     const gear = gearRef.current;
@@ -454,6 +492,14 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const discoverCapabilities = useCallback(async (symbol: string): Promise<void> => {
     const session = sessionRef.current;
     if (!session || !connectedRef.current) return;
+    const cached = capabilityCacheRef.current[symbol];
+    if (cached?.ready) {
+      const turboMin = Math.max(1, cached.minStakeByType.TURBOSLONG ?? 1, cached.minStakeByType.TURBOSSHORT ?? 1);
+      const vanillaMin = Math.max(1, cached.minStakeByType.VANILLALONGCALL ?? 1, cached.minStakeByType.VANILLALONGPUT ?? 1);
+      setMinimumStakeBySymbol((previous) => ({ ...previous, [symbol]: { turbo: turboMin, vanilla: vanillaMin } }));
+      setCapabilities((previous) => ({ ...previous, [symbol]: cached }));
+      return;
+    }
     try {
       ++reqIdCounterRef.current;
       // Deriv contracts_for discovery intentionally sends only the symbol.
@@ -461,33 +507,41 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       if (!aliveRef.current) return;
       const types = new Set(offers.map((offer) => offer.contractType.toUpperCase()));
       const barrierChoicesByType: Record<string, string[]> = {};
+      const minStakeByType: Record<string, number> = {};
+      const minDurationByType: Record<string, string> = {};
       for (const offer of offers) {
         const contractType = offer.contractType.toUpperCase();
+        if (offer.defaultStake > 0) minStakeByType[contractType] = offer.defaultStake;
+        if (offer.minContractDuration) minDurationByType[contractType] = offer.minContractDuration;
         const choices = [...(offer.barrier ? [offer.barrier] : []), ...(offer.barrierChoices ?? [])]
           .map((choice) => String(choice).trim())
           .filter((choice) => choice.length > 0);
         barrierChoicesByType[contractType] = Array.from(new Set([...(barrierChoicesByType[contractType] ?? []), ...choices]));
       }
       const barriers = Object.values(barrierChoicesByType).flat().filter((barrier, index, all) => all.indexOf(barrier) === index);
-      setCapabilities((previous) => ({
-        ...previous,
-        [symbol]: {
-          symbol,
-          ready: true,
-          error: null,
-          call: types.has("CALL"),
-          put: types.has("PUT"),
-          oneTouch: types.has("ONETOUCH"),
-          noTouch: types.has("NOTOUCH"),
-          turboLong: types.has("TURBOSLONG"),
-          turboShort: types.has("TURBOSSHORT"),
-          vanillaCall: types.has("VANILLALONGCALL"),
-          vanillaPut: types.has("VANILLALONGPUT"),
-          minContractDuration: offers.find((offer) => offer.minContractDuration)?.minContractDuration ?? "",
-          barriers: barriers.sort((a, b) => Math.abs(Number(a)) - Math.abs(Number(b))).slice(0, 20),
-          barrierChoicesByType,
-        },
-      }));
+      const capability: CapabilityRow = {
+        symbol,
+        ready: true,
+        error: null,
+        call: types.has("CALL"),
+        put: types.has("PUT"),
+        oneTouch: types.has("ONETOUCH"),
+        noTouch: types.has("NOTOUCH"),
+        turboLong: types.has("TURBOSLONG"),
+        turboShort: types.has("TURBOSSHORT"),
+        vanillaCall: types.has("VANILLALONGCALL"),
+        vanillaPut: types.has("VANILLALONGPUT"),
+        minContractDuration: offers.find((offer) => offer.minContractDuration)?.minContractDuration ?? "",
+        barriers: barriers.sort((a, b) => Math.abs(Number(a)) - Math.abs(Number(b))).slice(0, 20),
+        barrierChoicesByType,
+        minStakeByType,
+        minDurationByType,
+      };
+      capabilityCacheRef.current[symbol] = capability;
+      const turboMin = Math.max(1, minStakeByType.TURBOSLONG ?? 1, minStakeByType.TURBOSSHORT ?? 1);
+      const vanillaMin = Math.max(1, minStakeByType.VANILLALONGCALL ?? 1, minStakeByType.VANILLALONGPUT ?? 1);
+      setMinimumStakeBySymbol((previous) => ({ ...previous, [symbol]: { turbo: turboMin, vanilla: vanillaMin } }));
+      setCapabilities((previous) => ({ ...previous, [symbol]: capability }));
     } catch (error) {
       setCapabilities((previous) => ({
         ...previous,
@@ -506,15 +560,12 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
           minContractDuration: "",
           barriers: [],
           barrierChoicesByType: {},
+          minStakeByType: {},
+          minDurationByType: {},
         },
       }));
     }
   }, [sessionRef]);
-
-  useEffect(() => {
-    if (!connected) return;
-    void discoverCapabilities(selectedSymbol);
-  }, [connected, selectedSymbol, discoverCapabilities]);
 
   const startFeed = useCallback(async (symbol: string): Promise<void> => {
     const session = sessionRef.current;
@@ -530,36 +581,44 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     const cachedQuotes = tickCacheRef.current[symbol];
     if (cachedQuotes && cachedQuotes.length > 0) {
       const cachedTicks = cachedQuotes.map((quote, index) => ({ quote, epoch: Date.now() - (cachedQuotes.length - index) }));
-      ticksRef.current = cachedTicks;
-      setHistory(cachedTicks);
-      const range = (rows: readonly number[]): number => {
-        if (rows.length < 2) return 0;
-        let sum = 0;
-        for (let index = 1; index < rows.length; index += 1) sum += Math.abs(rows[index] - rows[index - 1]);
-        return sum / (rows.length - 1);
-      };
-      setAtr15(range(cachedQuotes.slice(-15)));
-      setAtr100(range(cachedQuotes.slice(-100)));
-      setSpot(cachedQuotes[cachedQuotes.length - 1] ?? 0);
-      setWarmBufferStatus(null);
+      ticksBySymbolRef.current[symbol] = cachedTicks;
+      const cachedAtr15 = rangeAtr(cachedQuotes.slice(-15));
+      const cachedAtr100 = rangeAtr(cachedQuotes.slice(-100));
+      const cachedSpot = cachedQuotes[cachedQuotes.length - 1] ?? 0;
+      const decimals = decimalsFromLatestQuote(cachedSpot);
+      const metric = { quotes: cachedQuotes.slice(-120), spot: cachedSpot, atr15: cachedAtr15, atr100: cachedAtr100, decimals };
+      feedMetricsRef.current[symbol] = metric;
+      setFeedTelemetry((previous) => ({ ...previous, [symbol]: metric }));
+      if (symbol === selectedRef.current) {
+        ticksRef.current = cachedTicks;
+        setHistory(cachedTicks);
+        setAtr15(cachedAtr15);
+        setAtr100(cachedAtr100);
+        setSpot(cachedSpot);
+        setWarmBufferStatus(null);
+      }
     } else {
       try {
         ++reqIdCounterRef.current;
         const historyTicks = await session.history(symbol, 100, "ticks");
-        if (!aliveRef.current || selectedRef.current !== symbol) return;
-        const quotes = historyTicks.map((tick) => tick.quote).filter((quote) => Number.isFinite(quote) && quote > 0).slice(-120);
+        if (!aliveRef.current || ![selectedRef.current, secondaryRef.current].includes(symbol)) return;
+        const cachedTicks = historyTicks.slice(-120);
+        const quotes = cachedTicks.map((tick) => tick.quote).filter((quote) => Number.isFinite(quote) && quote > 0).slice(-120);
         tickCacheRef.current[symbol] = quotes;
-        ticksRef.current = historyTicks.slice(-120);
-        setHistory(historyTicks.slice(-120));
-        const range = (rows: readonly number[]): number => {
-          if (rows.length < 2) return 0;
-          let sum = 0;
-          for (let index = 1; index < rows.length; index += 1) sum += Math.abs(rows[index] - rows[index - 1]);
-          return sum / (rows.length - 1);
-        };
-        setAtr15(range(quotes.slice(-15)));
-        setAtr100(range(quotes.slice(-100)));
-        if (quotes.length > 0) setSpot(quotes[quotes.length - 1]);
+        ticksBySymbolRef.current[symbol] = cachedTicks;
+        const feedSpot = quotes[quotes.length - 1] ?? 0;
+        const feedAtr15 = rangeAtr(quotes.slice(-15));
+        const feedAtr100 = rangeAtr(quotes.slice(-100));
+        const metric = { quotes, spot: feedSpot, atr15: feedAtr15, atr100: feedAtr100, decimals: decimalsFromLatestQuote(feedSpot) };
+        feedMetricsRef.current[symbol] = metric;
+        setFeedTelemetry((previous) => ({ ...previous, [symbol]: metric }));
+        if (symbol === selectedRef.current) {
+          ticksRef.current = cachedTicks;
+          setHistory(cachedTicks);
+          setAtr15(feedAtr15);
+          setAtr100(feedAtr100);
+          if (feedSpot > 0) setSpot(feedSpot);
+        }
       } catch (error) {
         const code = (error as { code?: unknown } | null)?.code ?? "";
         if (String(code).toLowerCase() === "ratelimit") {
@@ -573,7 +632,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     try {
       ++reqIdCounterRef.current;
       const subscriptionId = await session.subscribeTicksFor(symbol);
-      if (!aliveRef.current || selectedRef.current !== symbol) {
+      if (!aliveRef.current || ![selectedRef.current, secondaryRef.current].includes(symbol)) {
         if (subscriptionId) void session.forget(subscriptionId);
         return;
       }
@@ -587,51 +646,47 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     if (!connected) return;
     const session = sessionRef.current;
     if (!session) return;
+    let cancelled = false;
+    let staggerTimer: number | undefined;
+    const activeSymbols = Array.from(new Set([selectedSymbol, secondarySymbol].filter((symbol) => symbol && symbol !== "NONE")));
     const handler = (symbol: string, tick: Tick): void => {
-      if (symbol !== selectedRef.current) return;
+      if (!activeSymbols.includes(symbol)) return;
       const quote = Number(tick.quote);
       if (!Number.isFinite(quote) || quote <= 0) return;
-      ticksRef.current = [...ticksRef.current.slice(-119), { ...tick, quote }];
-      setHistory(ticksRef.current);
-      setSpot(quote);
-      const quotes = tickCacheRef.current[selectedRef.current]
-        ? [...tickCacheRef.current[selectedRef.current], quote].slice(-120)
-        : ticksRef.current.map((item) => item.quote).slice(-120);
-      tickCacheRef.current[selectedRef.current] = quotes;
-      if (warmBufferStatus !== null) {
-        const liveCount = quotes.length;
-        if (liveCount >= 15) setWarmBufferStatus(null);
-        else setWarmBufferStatus("Warming live buffer: " + liveCount + "/15 ticks...");
+      const symbolTicks = [...(ticksBySymbolRef.current[symbol] ?? []).slice(-119), { ...tick, quote }];
+      ticksBySymbolRef.current[symbol] = symbolTicks;
+      const quotes = [...(tickCacheRef.current[symbol] ?? []), quote].slice(-120);
+      tickCacheRef.current[symbol] = quotes;
+      const atr15Live = rangeAtr(quotes.slice(-15));
+      const atr100Live = rangeAtr(quotes.slice(-100));
+      const metric = { quotes, spot: quote, atr15: atr15Live, atr100: atr100Live, decimals: decimalsFromLatestQuote(quote) };
+      feedMetricsRef.current[symbol] = metric;
+      setFeedTelemetry((previous) => ({ ...previous, [symbol]: metric }));
+
+      if (symbol === selectedRef.current) {
+        ticksRef.current = symbolTicks;
+        setHistory(symbolTicks);
+        setSpot(quote);
+        setAtr15(atr15Live);
+        setAtr100(atr100Live);
+        if (warmBufferStatus !== null) {
+          if (quotes.length >= 15) setWarmBufferStatus(null);
+          else setWarmBufferStatus("Warming live buffer: " + quotes.length + "/15 ticks...");
+        }
       }
-      const range = (rows: readonly number[]): number => {
-        if (rows.length < 2) return 0;
-        let sum = 0;
-        for (let index = 1; index < rows.length; index += 1) sum += Math.abs(rows[index] - rows[index - 1]);
-        return sum / (rows.length - 1);
-      };
-      const atr15Live = range(quotes.slice(-15));
-      const atr100Live = range(quotes.slice(-100));
-      setAtr15(atr15Live);
-      setAtr100(atr100Live);
+
       const currentRound = roundRef.current;
-      if (currentRound) {
+      if (currentRound && currentRound.symbol === symbol) {
         const nextRound = { ...currentRound, ticksElapsed: currentRound.ticksElapsed + 1 };
-        if (
-          nextRound.gear === 2
-          && dangerShieldRef.current
-          && !nextRound.dangerShieldSent
-          && koOffset !== 0
-        ) {
+        if (nextRound.gear === 2 && dangerShieldRef.current && !nextRound.dangerShieldSent && koOffsetRef.current !== 0) {
           const directionSign = nextRound.direction === "LONG" ? 1 : -1;
-          const pullbackDistance = Math.abs(tick.quote - nextRound.startSpot);
-          const koDistance = Math.abs(koOffset);
-          const triggerDistance = koDistance * (dangerPctRef.current / 100);
-          const awayFromStart = directionSign * (tick.quote - nextRound.startSpot);
+          const triggerDistance = Math.abs(koOffsetRef.current) * (dangerPctRef.current / 100);
+          const awayFromStart = directionSign * (quote - nextRound.startSpot);
           if (awayFromStart >= triggerDistance) {
-            const touch = resolveBarrier(nextRound.symbol, "ONETOUCH", "touch");
-            void placeBundle(nextRound.symbol, 2, [{
+            const touch = resolveBarrierRef.current(nextRound.symbol, "ONETOUCH", "touch");
+            void placeBundleRef.current(nextRound.symbol, 2, [{
               contractType: "ONETOUCH",
-              barrier: String(touch),
+              barrier: touch,
               duration: 5,
               durationUnit: "t",
               stake: PHOENIX_MIN_STAKE,
@@ -648,39 +703,60 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         roundRef.current = nextRound;
         setRound(nextRound);
       }
+
       if (armedRef.current && !execRef.current && !coolingRef.current) {
         const quoteDecimals = decimalsFromLatestQuote(quote);
-        const barrierOffset = touchOffsetRef.current > 0
-          ? touchOffsetRef.current
+        const exactOffset = cleanBarrierOffset(resolveBarrierRef.current(symbol, "ONETOUCH", "touch", quote, atr15Live), quoteDecimals);
+        const barrierOffset = exactOffset > 0
+          ? exactOffset
           : syntheticTouchOffset(atr15Live, pipSizeFromDecimals(quoteDecimals), quoteDecimals);
         const gate = phoenixEntryGate(quotes, atr15Live, atr100Live, barrierOffset);
         if (!gate.allowed) {
-          setPhase(gate.reason);
+          setPhase(gate.reason + " · " + symbol);
         } else {
-          const direction = gate.impulseMove >= 0 ? "LONG" : "SHORT";
-          fireRoundRef.current(direction);
+          fireRoundRef.current(gate.impulseMove >= 0 ? "LONG" : "SHORT", symbol);
         }
       }
     };
-    session.onTickFor = handler;
-    void startFeed(selectedSymbol);
+    session.onTickAny = handler;
+
+    const seedActiveMarkets = async (): Promise<void> => {
+      const primary = activeSymbols[0];
+      if (!primary) return;
+      await discoverCapabilities(primary);
+      if (cancelled) return;
+      await startFeed(primary);
+      if (activeSymbols.length < 2) return;
+      await new Promise<void>((resolve) => {
+        staggerTimer = window.setTimeout(resolve, 400);
+      });
+      if (cancelled) return;
+      const secondary = activeSymbols[1];
+      await discoverCapabilities(secondary);
+      if (cancelled) return;
+      await startFeed(secondary);
+    };
+    void seedActiveMarkets();
+
     return () => {
-      if (session.onTickFor === handler) session.onTickFor = null;
-      const subscriptionId = radarSubsRef.current.get(selectedSymbol);
-      if (subscriptionId) {
+      cancelled = true;
+      if (staggerTimer !== undefined) window.clearTimeout(staggerTimer);
+      if (session.onTickAny === handler) session.onTickAny = null;
+      for (const [symbol, subscriptionId] of Array.from(radarSubsRef.current.entries())) {
+        if (!subscriptionId) continue;
         ++reqIdCounterRef.current;
         void session.forget(subscriptionId);
-        radarSubsRef.current.delete(selectedSymbol);
+        radarSubsRef.current.delete(symbol);
       }
     };
-  }, [connected, selectedSymbol]);
+  }, [accountId, connected, selectedSymbol, secondarySymbol]);
 
-  const resolveBarrier = useCallback((symbol: string, contractType: "TURBOSLONG" | "TURBOSSHORT" | "ONETOUCH" | "NOTOUCH" | "VANILLA", side: "ko" | "touch" | "atm"): string => {
+  const resolveBarrier = useCallback((symbol: string, contractType: "TURBOSLONG" | "TURBOSSHORT" | "ONETOUCH" | "NOTOUCH" | "VANILLA" | "VANILLALONGCALL" | "VANILLALONGPUT", side: "ko" | "touch" | "atm", spotValue = spot, atr15Value = atr15): string => {
     const row = capabilities[symbol];
     const choices = row?.barrierChoicesByType[
       contractType === "VANILLA" ? "VANILLALONGCALL" : contractType
     ] ?? row?.barriers ?? [];
-    const decimals = decimalsFromLatestQuote(spot);
+    const decimals = decimalsFromLatestQuote(spotValue);
     const pipSize = pipSizeFromDecimals(decimals);
 
     if (side === "atm") {
@@ -717,11 +793,15 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     }
 
     const validated = validatedTouchOffsetRef.current[symbol];
-    const synthetic = syntheticTouchOffset(atr15, pipSize, decimals, validated);
+    const synthetic = syntheticTouchOffset(atr15Value, pipSize, decimals, validated);
     const koLimited = koAbs > 0 ? Math.min(synthetic, koAbs * 0.75) : synthetic;
     const safeOffset = Math.min(koAbs > 0 ? koAbs * 0.75 : Number.MAX_SAFE_INTEGER, Math.max(pipSize * 20, koLimited));
     return formatBarrierOffset(safeOffset, decimals, true);
   }, [atr15, capabilities, koOffset, spot]);
+
+  useEffect(() => {
+    resolveBarrierRef.current = resolveBarrier;
+  }, [resolveBarrier]);
 
   const placeBundle = useCallback(async (symbol: string, gear: PhoenixGear, requests: PhoenixLegRequest[]): Promise<void> => {
     const session = sessionRef.current;
@@ -732,7 +812,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         symbol: string;
         contract: string;
         duration: number;
-        durationUnit: "t";
+        durationUnit: "t" | "s" | "m";
         stake: number;
         currency: string;
         barrier?: string;
@@ -741,7 +821,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         symbol,
         contract: contractType,
         duration: request.duration,
-        durationUnit: "t",
+        durationUnit: request.durationUnit,
         stake: request.stake,
         currency: currencyRef.current,
       };
@@ -761,18 +841,45 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     });
 
     let quotes;
+    let minimumStakeRetried = false;
+    const raiseDiscoveredMinimumStake = (error: unknown): boolean => {
+      if (minimumStakeRetried || (gear !== 2 && gear !== 3)) return false;
+      const message = error instanceof Error ? error.message : String(error);
+      const match = message.match(/at least\s+\$?([0-9]+(?:\.[0-9]+)?)/i);
+      if (!match) return false;
+      const minimum = Number(match[1]);
+      if (!Number.isFinite(minimum) || minimum <= 0) return false;
+      const targetIndex = payloadRequests.findIndex((request) => gear === 2
+        ? request.contract === "TURBOSLONG" || request.contract === "TURBOSSHORT"
+        : request.contract === "VANILLALONGCALL" || request.contract === "VANILLALONGPUT");
+      if (targetIndex < 0 || minimum <= payloadRequests[targetIndex].stake) return false;
+      const contract = payloadRequests[targetIndex].contract;
+      payloadRequests[targetIndex] = { ...payloadRequests[targetIndex], stake: minimum };
+      requests[targetIndex].stake = minimum;
+      minimumStakeRetried = true;
+      if (gear === 2) {
+        discoveredTurboMinStakeRef.current[symbol] = minimum;
+        setMinimumStakeBySymbol((previous) => ({ ...previous, [symbol]: { turbo: minimum, vanilla: previous[symbol]?.vanilla ?? 1 } }));
+      } else {
+        discoveredVanillaMinStakeRef.current[symbol] = minimum;
+        setMinimumStakeBySymbol((previous) => ({ ...previous, [symbol]: { turbo: previous[symbol]?.turbo ?? 1, vanilla: minimum } }));
+      }
+      setPhase("MIN STAKE: $" + minimum.toFixed(2) + " · retrying " + contract);
+      return true;
+    };
     const barrierContractIndex = payloadRequests.findIndex((request) => request.contract === "ONETOUCH" || request.contract === "NOTOUCH");
 
     if (barrierContractIndex >= 0) {
       let workingPayloads = payloadRequests;
       let escalation = 1;
+      let barrierRetries = 0;
       let lastError: unknown = null;
-      for (let attempt = 0; attempt < 4; attempt += 1) {
+      for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
           quotes = await session.quoteBundle(workingPayloads);
           const workingRequest = workingPayloads[barrierContractIndex];
           if (typeof workingRequest?.barrier === "string") {
-            const workingOffset = cleanBarrierOffset(workingRequest.barrier, decimalsFromLatestQuote(spot));
+            const workingOffset = cleanBarrierOffset(workingRequest.barrier, decimalsFromLatestQuote(feedMetricsRef.current[symbol]?.spot ?? spot));
             if (workingOffset > 0) validatedTouchOffsetRef.current[symbol] = workingOffset;
           }
           lastError = null;
@@ -780,11 +887,16 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         } catch (error) {
           lastError = error;
           const detail = error instanceof Error ? error.message : String(error);
+          if (raiseDiscoveredMinimumStake(error)) {
+            workingPayloads = payloadRequests;
+            continue;
+          }
           const distanceError = /away from the spot|pip|barrier.*distance|minimum.*barrier/i.test(detail);
-          if (!distanceError || attempt >= 3) break;
+          if (!distanceError || barrierRetries >= 3) break;
 
+          barrierRetries += 1;
           escalation *= 2.5;
-          const decimals = decimalsFromLatestQuote(spot);
+          const decimals = decimalsFromLatestQuote(feedMetricsRef.current[symbol]?.spot ?? spot);
           workingPayloads = workingPayloads.map((request) => {
             if (request.contract !== "ONETOUCH" && request.contract !== "NOTOUCH") return request;
             if (typeof request.barrier !== "string") return request;
@@ -804,10 +916,20 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       try {
         quotes = await session.quoteBundle(payloadRequests);
       } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const failedRequest = payloadRequests.find((request) => request.contract !== "CALL" && request.contract !== "PUT") ?? payloadRequests[0];
-        const failedBarrier = typeof failedRequest?.barrier === "string" ? failedRequest.barrier : "<none>";
-        throw new Error(failedRequest.contract + " (" + failedBarrier + "): " + detail);
+        if (raiseDiscoveredMinimumStake(error)) {
+          try {
+            quotes = await session.quoteBundle(payloadRequests);
+          } catch (retryError) {
+            const retryDetail = retryError instanceof Error ? retryError.message : String(retryError);
+            const failedRequest = payloadRequests.find((request) => request.contract !== "CALL" && request.contract !== "PUT") ?? payloadRequests[0];
+            throw new Error(failedRequest.contract + " (" + (failedRequest.barrier ?? "<none>") + "): " + retryDetail);
+          }
+        } else {
+          const detail = error instanceof Error ? error.message : String(error);
+          const failedRequest = payloadRequests.find((request) => request.contract !== "CALL" && request.contract !== "PUT") ?? payloadRequests[0];
+          const failedBarrier = typeof failedRequest?.barrier === "string" ? failedRequest.barrier : "<none>";
+          throw new Error(failedRequest.contract + " (" + failedBarrier + "): " + detail);
+        }
       }
     }
     const ids = await Promise.all(quotes.map((quote, index) => session.buy(quote.id, quote.ask).then((contractId) => {
@@ -841,12 +963,21 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     }));
   }, [sessionRef]);
 
-  const fireRound = useCallback(async (direction: "LONG" | "SHORT" = "LONG"): Promise<void> => {
+  useEffect(() => {
+    placeBundleRef.current = placeBundle;
+  }, [placeBundle]);
+
+  const fireRound = useCallback(async (direction: "LONG" | "SHORT" = "LONG", symbol = selectedRef.current): Promise<void> => {
     if (!connectedRef.current || execRef.current || coolingRef.current || roundRef.current || activePhoenixIdsRef.current.size > 0) return;
     const session = sessionRef.current;
     if (!session) { onConnect(); return; }
-    const symbol = selectedRef.current;
-    const gear = runDecision.gear;
+    const symbolMetrics = feedMetricsRef.current[symbol];
+    const spotNow = symbolMetrics?.spot ?? spot;
+    const atr15Now = symbolMetrics?.atr15 ?? atr15;
+    const atr100Now = symbolMetrics?.atr100 ?? atr100;
+    const touchOffsetNow = symbol === selectedRef.current ? touchOffsetRef.current : Math.max(atr15Now * 1.8, 0);
+    const symbolDecision = routePhoenixGear(primaryGearRef.current, autoRouterRef.current, atr15Now, atr100Now, touchOffsetNow);
+    const gear = symbolDecision.gear;
     gearRef.current = gear;
     const id = ++roundSeqRef.current;
     const current: PhoenixRound = {
@@ -854,7 +985,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       symbol,
       gear,
       direction: gear === 3 ? "LONG_SHORT" : direction,
-      startSpot: spot,
+      startSpot: spotNow,
       startAt: Date.now(),
       ticksElapsed: 0,
       legs: [],
@@ -868,29 +999,67 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
 
     try {
       if (gear === 1) {
-        const requests = microPhoenixRequests(direction, spot, baseRef.current, touchOffset);
-        const exactTouchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch");
+        const requests = microPhoenixRequests(direction, spotNow, baseRef.current, touchOffsetNow);
+        const exactTouchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch", spotNow, atr15Now);
         const shield = requests[1];
         if (shield) shield.barrier = exactTouchBarrier;
         setPhase("Gear 1 · buying CALL/PUT impulse + opposite-side interior shield");
         await placeBundle(symbol, gear, requests);
       } else if (gear === 2) {
-        const koBarrier = resolveBarrier(symbol, "TURBOSLONG", "ko");
-        const touchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch");
-        const ko = cleanBarrierOffset(koBarrier, 2);
-        const touch = cleanBarrierOffset(touchBarrier, 2);
-        setKoOffset(ko * (koBarrier.trim().startsWith("-") ? -1 : 1));
-        setTouchOffset(touch * (touchBarrier.trim().startsWith("-") ? -1 : 1));
-        const requests = turbinePhoenixRequests(direction, koBarrier, touchBarrier, turboRef.current, PHOENIX_MIN_STAKE);
+        const turboType = direction === "LONG" ? "TURBOSLONG" : "TURBOSSHORT";
+        const koBarrier = resolveBarrier(symbol, turboType, "ko", spotNow, atr15Now);
+        const decimals = decimalsFromLatestQuote(spotNow);
+        const pipSize = pipSizeFromDecimals(decimals);
+        const ko = cleanBarrierOffset(koBarrier, decimals);
+        const discoveredTouchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch", spotNow, atr15Now);
+        const discoveredTouch = cleanBarrierOffset(discoveredTouchBarrier, decimals);
+        const minimumInterior = Math.max(pipSize * 20, atr15Now * 1.8);
+        const maxInterior = ko - pipSize;
+        if (maxInterior < minimumInterior) throw new Error("No interior ONETOUCH barrier is safely inside the selected Turbo KO barrier.");
+        const touch = Math.min(maxInterior, Math.max(minimumInterior, discoveredTouch));
+        const touchBarrier = formatBarrierOffset(touch, decimals, true);
+        const signedKo = ko * (koBarrier.trim().startsWith("-") ? -1 : 1);
+        const signedTouch = touch * (touchBarrier.trim().startsWith("-") ? -1 : 1);
+        koOffsetRef.current = signedKo;
+        touchOffsetRef.current = signedTouch;
+        setKoOffset(signedKo);
+        setTouchOffset(signedTouch);
+        const turboMinimum = Math.max(
+          1,
+          capabilities[symbol]?.minStakeByType[turboType] ?? 1,
+          discoveredTurboMinStakeRef.current[symbol] ?? 1,
+        );
+        const effectiveTurboStake = Math.max(turboRef.current, turboMinimum);
+        const turboDuration = parsePhoenixDuration(capabilities[symbol]?.minDurationByType[turboType], { duration: 1, durationUnit: "t" });
+        const requests = turbinePhoenixRequests(direction, koBarrier, touchBarrier, effectiveTurboStake, PHOENIX_MIN_STAKE, turboDuration.duration, turboDuration.durationUnit);
         setPhase(dangerShieldRef.current ? "Gear 2 · Turbo-only T0; interior shield waits for danger pullback" : "Gear 2 · buying Turbo + interior ONETOUCH simultaneously");
         await placeBundle(symbol, gear, dangerShieldRef.current ? [requests[0]] : requests);
       } else if (gear === 3) {
         setPhase("Gear 3 · buying ATM Vanilla call + put simultaneously");
-        const atmBarrier = resolveBarrier(symbol, "VANILLA", "atm");
-        await placeBundle(symbol, gear, vanillaRequests(1, atmBarrier));
+        const atmCallBarrier = resolveBarrier(symbol, "VANILLALONGCALL", "atm", spotNow, atr15Now);
+        const atmPutBarrier = resolveBarrier(symbol, "VANILLALONGPUT", "atm", spotNow, atr15Now);
+        const vanillaMinimum = Math.max(
+          1,
+          capabilities[symbol]?.minStakeByType.VANILLALONGCALL ?? 1,
+          capabilities[symbol]?.minStakeByType.VANILLALONGPUT ?? 1,
+          discoveredVanillaMinStakeRef.current[symbol] ?? 1,
+        );
+        const effectiveVanillaStake = Math.max(baseRef.current, vanillaMinimum);
+        const callDuration = parsePhoenixDuration(capabilities[symbol]?.minDurationByType.VANILLALONGCALL);
+        const putDuration = parsePhoenixDuration(capabilities[symbol]?.minDurationByType.VANILLALONGPUT);
+        const requests = vanillaRequests(effectiveVanillaStake, atmCallBarrier).map((request, index) => {
+          const duration = index === 0 ? callDuration : putDuration;
+          return {
+            ...request,
+            barrier: index === 0 ? atmCallBarrier : atmPutBarrier,
+            duration: duration.duration,
+            durationUnit: duration.durationUnit,
+          };
+        });
+        await placeBundle(symbol, gear, requests);
       } else {
         setPhase("Gear 4 · buying minimum-duration NOTOUCH range box");
-        const noTouchBarrier = resolveBarrier(symbol, "NOTOUCH", "touch");
+        const noTouchBarrier = resolveBarrier(symbol, "NOTOUCH", "touch", spotNow, atr15Now);
         await placeBundle(symbol, gear, [rangeBoxRequest(baseRef.current, noTouchBarrier)]);
       }
     } catch (error) {
@@ -905,10 +1074,10 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         onNotice("Phoenix round could not be placed: " + (error instanceof Error ? error.message : String(error)), "bad");
       }
     }
-  }, [connectedRef, onConnect, onNotice, placeBundle, resolveBarrier, runDecision, spot, touchOffset]);
+  }, [atr15, atr100, connectedRef, onConnect, onNotice, placeBundle, resolveBarrier, runDecision, spot, touchOffset]);
 
   useEffect(() => {
-    fireRoundRef.current = (direction) => { void fireRound(direction); };
+    fireRoundRef.current = (direction, symbol) => { void fireRound(direction, symbol); };
   }, [fireRound]);
 
   const armEngine = useCallback(() => {
@@ -1019,6 +1188,25 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
                   </div>
                 ))}
               </div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                {[selectedSymbol, ...(secondarySymbol !== "NONE" && secondarySymbol !== selectedSymbol ? [secondarySymbol] : [])].map((symbol, index) => {
+                  const metric = feedTelemetry[symbol];
+                  const gate = metric
+                    ? phoenixEntryGate(metric.quotes, metric.atr15, metric.atr100, Math.max(Math.abs(touchOffset), metric.atr15 * 1.8))
+                    : null;
+                  return (
+                    <div key={symbol} className="flex items-center justify-between gap-2 rounded border border-line bg-ink/50 px-2 py-1.5">
+                      <div>
+                        <p className="text-[8px] uppercase tracking-widest text-muted">{index === 0 ? "Primary" : "Secondary"} · {symbol}</p>
+                        <p className="mt-0.5 font-mono text-[9px] text-slate-300">{metric ? "ATR15 " + metric.atr15.toFixed(5) + " / ATR100 " + metric.atr100.toFixed(5) : "Warming feed…"}</p>
+                      </div>
+                      <span className={"rounded border px-1.5 py-0.5 text-[8px] font-semibold " + (gate?.allowed ? "border-emerald-400/40 text-emerald-300" : "border-amber-400/40 text-amber-200")}>
+                        {gate?.allowed ? "IMPULSE READY" : gate?.reason ?? "WARMING"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
             </section>
           </div>
 
@@ -1028,11 +1216,18 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
                 <h2 className="text-sm font-semibold tracking-tight">Gear control</h2>
                 <span className="rounded border border-line px-2 py-0.5 text-[9px] uppercase tracking-widest text-muted">{runDecision.gear === 4 ? "Range box" : "Gear " + runDecision.gear}</span>
               </div>
-              <div className="mt-3">
-                <p className="text-[9px] uppercase tracking-widest text-muted">Market</p>
-                <select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}>
-                  {PHOENIX_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}
-                </select>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <Field label="Primary market">
+                  <select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}>
+                    {PHOENIX_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}
+                  </select>
+                </Field>
+                <Field label="Secondary radar">
+                  <select value={secondarySymbol} onChange={(event) => setSecondarySymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}>
+                    <option value="NONE">NONE</option>
+                    {PHOENIX_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}
+                  </select>
+                </Field>
               </div>
               <div className="mt-2">
                 <p className="text-[9px] uppercase tracking-widest text-muted">Primary gear</p>
@@ -1054,6 +1249,9 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
 
               {primaryGear === 2 ? (
                 <div className="mt-2 space-y-2 rounded border border-line bg-ink/50 p-2">
+                  <p className="inline-flex rounded border border-amber-400/40 bg-amber-400/10 px-2 py-1 text-[9px] font-semibold text-amber-200">
+                    MIN STAKE: ${(minimumStakeBySymbol[selectedSymbol]?.turbo ?? 1).toFixed(2)}
+                  </p>
                   <div className="flex items-center justify-between"><div><p className="text-[10px] font-semibold text-slate-200">Contingent danger shield</p><p className="text-[9px] text-muted">Auto-fire ONETOUCH after pullback.</p></div><button type="button" onClick={() => setDangerShield((value) => !value)} disabled={executing || round !== null} className={"rounded border px-2 py-1 text-[9px] font-semibold " + (dangerShield ? "border-emerald-400/50 text-emerald-300" : "border-line text-muted")}>{dangerShield ? "ON" : "OFF"}</button></div>
                   <Field label="Danger trigger %"><input type="number" min={1} max={100} step={1} value={dangerTriggerPct} disabled={executing || round !== null} onChange={(event) => setDangerTriggerPct(Math.max(1, Math.min(100, Number(event.target.value) || PHOENIX_DEFAULT_DANGER_TRIGGER)))} className={inputClass} /></Field>
                 </div>

@@ -146,6 +146,8 @@ export default function ChronoVaultPage(props: Props): ReactElement {
   } = props;
 
   const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ75V");
+  const [secondarySymbol, setSecondarySymbol] = useState<string>("1HZ100V");
+  const [feedTelemetry, setFeedTelemetry] = useState<Record<string, { spot: number; atr15: number; atr100: number; impulseMove: number; efficiency: number }>>({});
   const [weaponMode, setWeaponMode] = useState<ChronoWeaponMode>("asian_impulse_only");
   const [baseLegStake, setBaseLegStake] = useState(CHRONO_MIN_STAKE);
   const [vaultEnabled, setVaultEnabled] = useState(true);
@@ -178,6 +180,7 @@ export default function ChronoVaultPage(props: Props): ReactElement {
   const accountIdRef = useRef(accountId);
   const currencyRef = useRef(currency);
   const selectedRef = useRef(selectedSymbol);
+  const secondaryRef = useRef(secondarySymbol);
   const baseStakeRef = useRef(baseLegStake);
   const weaponModeRef = useRef<ChronoWeaponMode>(weaponMode);
   const vaultEnabledRef = useRef(vaultEnabled);
@@ -199,6 +202,10 @@ export default function ChronoVaultPage(props: Props): ReactElement {
   const buyPriceRef = useRef<Map<number, number>>(new Map<number, number>());
   const peakBidRef = useRef<Map<number, number>>(new Map<number, number>());
   const ticksRef = useRef<Tick[]>([]);
+  const ticksBySymbolRef = useRef<Record<string, Tick[]>>({});
+  const tickCacheRef = useRef<Record<string, number[]>>({});
+  const capabilityCacheRef = useRef<Record<string, ChronoCapability>>({});
+  const scanAndFireRef = useRef<(quotes: readonly number[], symbol: string, localAtr15: number, localAtr100: number) => Promise<void>>(async () => undefined);
   const radarSubsRef = useRef<Map<string, string>>(new Map<string, string>());
   const cooldownTimerRef = useRef<number | undefined>(undefined);
 
@@ -217,6 +224,7 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     accountIdRef.current = accountId;
     currencyRef.current = currency;
     selectedRef.current = selectedSymbol;
+    secondaryRef.current = secondarySymbol;
     baseStakeRef.current = baseLegStake;
     weaponModeRef.current = weaponMode;
     vaultEnabledRef.current = vaultEnabled;
@@ -225,7 +233,7 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     accuTicksRef.current = targetAccuTicks;
     stopLossRef.current = stopLoss;
     takeProfitRef.current = takeProfit;
-  }, [accountId, baseLegStake, connected, currency, growthRate, selectedSymbol, stopLoss, targetAccuTicks, takeProfit, vaultEnabled, vaultUnlockThreshold, weaponMode]);
+  }, [accountId, baseLegStake, connected, currency, growthRate, secondarySymbol, selectedSymbol, stopLoss, targetAccuTicks, takeProfit, vaultEnabled, vaultUnlockThreshold, weaponMode]);
 
   useEffect(() => {
     if (!isSlManual) {
@@ -371,6 +379,11 @@ export default function ChronoVaultPage(props: Props): ReactElement {
   const discoverCapabilities = useCallback(async (symbol: string): Promise<void> => {
     const session = sessionRef.current;
     if (!session || !connectedRef.current) return;
+    const cached = capabilityCacheRef.current[symbol];
+    if (cached?.ready) {
+      setCapabilities((previous) => ({ ...previous, [symbol]: cached }));
+      return;
+    }
     try {
       ++reqIdCounterRef.current;
       // contracts_for must contain only the symbol field.
@@ -385,23 +398,22 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       const resetMinMatch = resetMinText.match(/\d+/);
       const resetMinTicks = resetMinMatch ? Number(resetMinMatch[0]) : 0;
       const resetTickSupported = resetOffers.length > 0 && resetMinTicks >= 1;
-      setCapabilities((previous) => ({
-        ...previous,
-        [symbol]: {
-          symbol,
-          ready: true,
-          error: null,
-          asianUp: types.has("ASIANU"),
-          asianDown: types.has("ASIAND"),
-          resetCall: types.has("RESETCALL"),
-          resetPut: types.has("RESETPUT"),
-          resetTickSupported,
-          resetMinTicks: resetTickSupported ? resetMinTicks : 0,
-          accumulator: types.has("ACCU"),
-          growthRates: [0.01, 0.02, 0.03, 0.04, 0.05],
-          minAccumulatorStake: 1,
-        },
-      }));
+      const capability: ChronoCapability = {
+        symbol,
+        ready: true,
+        error: null,
+        asianUp: types.has("ASIANU"),
+        asianDown: types.has("ASIAND"),
+        resetCall: types.has("RESETCALL"),
+        resetPut: types.has("RESETPUT"),
+        resetTickSupported,
+        resetMinTicks: resetTickSupported ? resetMinTicks : 0,
+        accumulator: types.has("ACCU"),
+        growthRates: [0.01, 0.02, 0.03, 0.04, 0.05],
+        minAccumulatorStake: 1,
+      };
+      capabilityCacheRef.current[symbol] = capability;
+      setCapabilities((previous) => ({ ...previous, [symbol]: capability }));
     } catch (error) {
       setCapabilities((previous) => ({
         ...previous,
@@ -423,30 +435,41 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     }
   }, [sessionRef]);
 
-  useEffect(() => {
-    if (!connected) return;
-    void discoverCapabilities(selectedSymbol);
-  }, [accountId, connected, discoverCapabilities, selectedSymbol]);
-
   const startFeed = useCallback(async (symbol: string): Promise<void> => {
     const session = sessionRef.current;
-    if (!session || !connectedRef.current) return;
-    if (radarSubsRef.current.has(symbol)) return;
+    if (!session || !connectedRef.current || radarSubsRef.current.has(symbol)) return;
     try {
-      ++reqIdCounterRef.current;
-      const historyTicks = await session.history(symbol, 100, "ticks");
-      if (!aliveRef.current) return;
-      ticksRef.current = historyTicks;
-      setTicks(historyTicks);
-      const quotes = historyTicks.map((tick) => tick.quote);
-      setSpot(quotes[quotes.length - 1] ?? 0);
-      setAtr15(atrFrom(quotes.slice(-15)));
-      setAtr100(atrFrom(quotes));
-      setEntryStrike(quotes[quotes.length - 1] ?? 0);
-      setResetTarget(null);
+      let seededTicks = ticksBySymbolRef.current[symbol];
+      if (!seededTicks || seededTicks.length === 0) {
+        ++reqIdCounterRef.current;
+        seededTicks = (await session.history(symbol, 100, "ticks")).slice(-120);
+      }
+      if (!aliveRef.current || ![selectedRef.current, secondaryRef.current].includes(symbol)) return;
+      const quotes = seededTicks.map((tick) => tick.quote).filter((quote) => Number.isFinite(quote) && quote > 0).slice(-120);
+      ticksBySymbolRef.current[symbol] = seededTicks;
+      tickCacheRef.current[symbol] = quotes;
+      const metric = { spot: quotes[quotes.length - 1] ?? 0, atr15: atrFrom(quotes.slice(-15)), atr100: atrFrom(quotes) };
+      const signal = analyzeMicrostructure(quotes);
+      setFeedTelemetry((previous) => ({
+        ...previous,
+        [symbol]: { ...metric, impulseMove: signal.momentumMove, efficiency: signal.efficiencyRatio },
+      }));
+      if (symbol === selectedRef.current) {
+        ticksRef.current = seededTicks;
+        setTicks(seededTicks);
+        setSpot(metric.spot);
+        setAtr15(metric.atr15);
+        setAtr100(metric.atr100);
+        setEntryStrike(metric.spot);
+        setResetTarget(null);
+      }
       ++reqIdCounterRef.current;
       const subscriptionId = await session.subscribeTicksFor(symbol);
       if (!subscriptionId) return;
+      if (![selectedRef.current, secondaryRef.current].includes(symbol)) {
+        void session.forget(subscriptionId);
+        return;
+      }
       radarSubsRef.current.set(symbol, subscriptionId);
     } catch (error) {
       onNotice("Chrono feed failed for " + symbol + ": " + (error instanceof Error ? error.message : String(error)), "bad");
@@ -457,36 +480,65 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     if (!connected) return;
     const session = sessionRef.current;
     if (!session) return;
+    let cancelled = false;
+    let staggerTimer: number | undefined;
+    const activeSymbols = Array.from(new Set([selectedSymbol, secondarySymbol].filter((symbol) => symbol && symbol !== "NONE")));
     const handler = (symbol: string, tick: Tick): void => {
-      if (symbol !== selectedRef.current) return;
-      const nextTicks = [...ticksRef.current.slice(-99), tick];
-      ticksRef.current = nextTicks;
-      setTicks(nextTicks);
-      const quotes = nextTicks.map((item) => item.quote);
-      setSpot(tick.quote);
-      setAtr15(atrFrom(quotes.slice(-15)));
-      setAtr100(atrFrom(quotes));
-
-      if (!entryStrike && quotes.length > 0) setEntryStrike(quotes[quotes.length - 1]);
-
-      if (roundRef.current?.tier === 2 && roundRef.current.weapon === "ACCU 5% CANNON") {
-        // ACCU sell-harvesting is authoritative in proposal_open_contract.
+      if (!activeSymbols.includes(symbol)) return;
+      const quote = Number(tick.quote);
+      if (!Number.isFinite(quote) || quote <= 0) return;
+      const nextTicks = [...(ticksBySymbolRef.current[symbol] ?? []).slice(-119), { ...tick, quote }];
+      ticksBySymbolRef.current[symbol] = nextTicks;
+      const quotes = [...(tickCacheRef.current[symbol] ?? []), quote].slice(-120);
+      tickCacheRef.current[symbol] = quotes;
+      const localAtr15 = atrFrom(quotes.slice(-15));
+      const localAtr100 = atrFrom(quotes.slice(-100));
+      const signal = analyzeMicrostructure(quotes);
+      setFeedTelemetry((previous) => ({
+        ...previous,
+        [symbol]: { spot: quote, atr15: localAtr15, atr100: localAtr100, impulseMove: signal.momentumMove, efficiency: signal.efficiencyRatio },
+      }));
+      if (symbol === selectedRef.current) {
+        ticksRef.current = nextTicks;
+        setTicks(nextTicks);
+        setSpot(quote);
+        setAtr15(localAtr15);
+        setAtr100(localAtr100);
+        if (!entryStrike && quotes.length > 0) setEntryStrike(quote);
       }
-
       if (armedRef.current && !execRef.current && !coolingRef.current) {
-        void scanAndFire(quotessafe(quotes));
+        void scanAndFireRef.current(quotes, symbol, localAtr15, localAtr100);
       }
     };
-    session.onTickFor = handler;
-    void startFeed(selectedSymbol);
-    return () => {
-      if (session.onTickFor === handler) session.onTickFor = null;
-      for (const id of radarSubsRef.current.values()) void session.forget(id);
-      radarSubsRef.current.clear();
-    };
-  }, [accountId, connected, selectedSymbol, sessionRef, startFeed]);
+    session.onTickAny = handler;
 
-  const quotessafe = useCallback((quotes: readonly number[]): readonly number[] => quotes, []);
+    const seedMarkets = async (): Promise<void> => {
+      const primary = activeSymbols[0];
+      if (!primary) return;
+      await discoverCapabilities(primary);
+      if (cancelled) return;
+      await startFeed(primary);
+      if (activeSymbols.length < 2) return;
+      await new Promise<void>((resolve) => { staggerTimer = window.setTimeout(resolve, 400); });
+      if (cancelled) return;
+      const secondary = activeSymbols[1];
+      await discoverCapabilities(secondary);
+      if (cancelled) return;
+      await startFeed(secondary);
+    };
+    void seedMarkets();
+    return () => {
+      cancelled = true;
+      if (staggerTimer !== undefined) window.clearTimeout(staggerTimer);
+      if (session.onTickAny === handler) session.onTickAny = null;
+      for (const [symbol, subscriptionId] of Array.from(radarSubsRef.current.entries())) {
+        if (!subscriptionId) continue;
+        ++reqIdCounterRef.current;
+        void session.forget(subscriptionId);
+        radarSubsRef.current.delete(symbol);
+      }
+    };
+  }, [accountId, connected, selectedSymbol, secondarySymbol]);
 
   const placeChronoPair = useCallback(async (symbol: string, tier: 1 | 2, weapon: ChronoWeapon, requests: ChronoLegRequest[]): Promise<void> => {
     const session = sessionRef.current;
@@ -602,15 +654,14 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     }));
   }, [sessionRef]);
 
-  const scanAndFire = useCallback(async (quotes: readonly number[]): Promise<void> => {
+  const scanAndFire = useCallback(async (quotes: readonly number[], symbol: string, localAtr15: number, localAtr100: number): Promise<void> => {
     if (!connectedRef.current || execRef.current || coolingRef.current || roundRef.current || activeChronoIdsRef.current.size > 0) return;
-    const symbol = selectedRef.current;
     const capability = capabilities[symbol];
     const signal = analyzeMicrostructure(quotes);
     const resetTickSupported = Boolean(capability?.resetTickSupported && capability.resetCall && capability.resetPut);
     const decision = chooseChronoWeapon(weaponModeRef.current, signal, resetTickSupported);
 
-    const compression = atr100 > 0 ? atr15 / atr100 : 1;
+    const compression = localAtr100 > 0 ? localAtr15 / localAtr100 : 1;
     if (vaultEnabledRef.current && tier1BankedProfitRef.current >= vaultThresholdRef.current && compression <= 0.70) {
       const cannonStake = Math.max(1, round2(tier1BankedProfitRef.current));
       const request = accumulatorRequest(cannonStake, growthRateRef.current);
@@ -692,7 +743,11 @@ export default function ChronoVaultPage(props: Props): ReactElement {
         onNotice("Chrono pair could not be placed: " + message, "bad");
       }
     }
-  }, [atr100, atr15, capabilities, onNotice, placeChronoPair]);
+  }, [capabilities, onNotice, placeChronoPair]);
+
+  useEffect(() => {
+    scanAndFireRef.current = scanAndFire;
+  }, [scanAndFire]);
 
   const armEngine = useCallback(() => {
     if (!connectedRef.current) { onConnect(); return; }
@@ -790,15 +845,27 @@ export default function ChronoVaultPage(props: Props): ReactElement {
                   <div key={label} className="rounded border border-line bg-ink/50 px-2 py-1.5"><p className="text-[8px] uppercase tracking-widest text-muted">{label}</p><p className="mt-0.5 font-mono text-[11px] text-slate-200">{value}</p></div>
                 ))}
               </div>
+              <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                {[selectedSymbol, ...(secondarySymbol !== "NONE" && secondarySymbol !== selectedSymbol ? [secondarySymbol] : [])].map((symbol, index) => {
+                  const metric = feedTelemetry[symbol];
+                  const ready = Boolean(metric && metric.atr100 > 0 && metric.atr15 >= metric.atr100 * 0.90 && Math.abs(metric.impulseMove) >= metric.atr15 * 1.55 && metric.efficiency >= 0.65);
+                  return (
+                    <div key={symbol} className="flex items-center justify-between gap-2 rounded border border-line bg-ink/50 px-2 py-1.5">
+                      <div><p className="text-[8px] uppercase tracking-widest text-muted">{index === 0 ? "Primary" : "Secondary"} · {symbol}</p><p className="mt-0.5 font-mono text-[9px] text-slate-300">{metric ? "ATR15 " + metric.atr15.toFixed(5) + " / ATR100 " + metric.atr100.toFixed(5) + " · ER3 " + metric.efficiency.toFixed(2) : "Warming feed…"}</p></div>
+                      <span className={"rounded border px-1.5 py-0.5 text-[8px] font-semibold " + (ready ? "border-emerald-400/40 text-emerald-300" : "border-amber-400/40 text-amber-200")}>{ready ? "IMPULSE READY" : "WAITING · 1.55x ATR"}</span>
+                    </div>
+                  );
+                })}
+              </div>
             </section>
           </div>
 
           <aside className="space-y-3">
             <section className="rounded-lg border border-line bg-panel p-3">
               <div className="flex items-center justify-between gap-2"><h2 className="text-sm font-semibold tracking-tight">Chrono control</h2><span className="rounded border border-line px-2 py-0.5 text-[9px] uppercase tracking-widest text-muted">Tier 1 / Tier 2</span></div>
-              <div className="mt-3">
-                <p className="text-[9px] uppercase tracking-widest text-muted">Market</p>
-                <select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}>{CHRONO_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}</select>
+              <div className="mt-3 grid grid-cols-2 gap-2">
+                <Field label="Primary market"><select value={selectedSymbol} onChange={(event) => setSelectedSymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}>{CHRONO_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}</select></Field>
+                <Field label="Secondary radar"><select value={secondarySymbol} onChange={(event) => setSecondarySymbol(event.target.value)} disabled={executing || round !== null} className={inputClass}><option value="NONE">NONE</option>{CHRONO_SYMBOLS.map((symbol) => <option key={symbol} value={symbol}>{symbol}</option>)}</select></Field>
               </div>
               <div className="mt-2">
                 <p className="text-[9px] uppercase tracking-widest text-muted">Weapon mode</p>

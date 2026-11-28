@@ -143,8 +143,8 @@ export function phoenixEntryGate(
   let path = 0;
   for (let index = 1; index < recent.length; index += 1) path += Math.abs(recent[index] - recent[index - 1]);
   const efficiencyRatio3 = path > 0 ? Math.abs(impulseMove) / path : 0;
-  const expansion = atr100 > 0 && atr15 >= atr100 * 1.15;
-  const impulse = Math.abs(impulseMove) >= atr15 * 2.2 && efficiencyRatio3 >= 0.72;
+  const expansion = atr100 > 0 && atr15 >= atr100 * 0.90;
+  const impulse = Math.abs(impulseMove) >= atr15 * 1.55 && efficiencyRatio3 >= 0.65;
   const reachable = atr15 * 5 >= Math.abs(touchBarrierOffset);
   if (!expansion) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION · VOLATILITY EXPANSION REQUIRED", impulseMove, efficiencyRatio3 };
   if (!impulse) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION", impulseMove, efficiencyRatio3 };
@@ -228,13 +228,15 @@ export function turbinePhoenixRequests(
   touchBarrier: string,
   turboStake: number,
   shieldStake = PHOENIX_MIN_STAKE,
+  turboDuration = 1,
+  turboDurationUnit: "t" | "s" | "m" = "t",
 ): PhoenixLegRequest[] {
   return [
     {
       contractType: direction === "LONG" ? "TURBOSLONG" : "TURBOSSHORT",
       barrier: koBarrier,
-      duration: 0,
-      durationUnit: "t",
+      duration: turboDuration,
+      durationUnit: turboDurationUnit,
       stake: round2(clamp(turboStake, PHOENIX_MIN_STAKE, 100)),
       label: direction === "LONG" ? "TURBOSLONG" : "TURBOSSHORT",
     },
@@ -249,11 +251,27 @@ export function turbinePhoenixRequests(
   ];
 }
 
-export function vanillaRequests(stake = 1, atmBarrier = "+0.0"): PhoenixLegRequest[] {
+export interface PhoenixDuration {
+  duration: number;
+  durationUnit: "t" | "s" | "m";
+}
+
+export function parsePhoenixDuration(raw: string | undefined, fallback: PhoenixDuration = { duration: 5, durationUnit: "t" }): PhoenixDuration {
+  if (!raw) return fallback;
+  const match = raw.trim().match(/^(\d+(?:\.\d+)?)\s*(ticks?|t|seconds?|s|minutes?|m)$/i);
+  if (!match) return fallback;
+  const duration = Number(match[1]);
+  if (!Number.isFinite(duration) || duration <= 0) return fallback;
+  const unitText = match[2].toLowerCase();
+  const durationUnit: PhoenixDuration["durationUnit"] = unitText.startsWith("m") ? "m" : unitText.startsWith("s") ? "s" : "t";
+  return { duration, durationUnit };
+}
+
+export function vanillaRequests(stake = 1, atmBarrier = "+0.0", duration = 5, durationUnit: "t" | "s" | "m" = "t"): PhoenixLegRequest[] {
   const safeStake = round2(clamp(stake, 0.35, 100));
   return [
-    { contractType: "VANILLALONGCALL", barrier: atmBarrier, duration: 5, durationUnit: "t", stake: safeStake, label: "ATM VANILLALONGCALL" },
-    { contractType: "VANILLALONGPUT", barrier: atmBarrier, duration: 5, durationUnit: "t", stake: safeStake, label: "ATM VANILLALONGPUT" },
+    { contractType: "VANILLALONGCALL", barrier: atmBarrier, duration, durationUnit, stake: safeStake, label: "ATM VANILLALONGCALL" },
+    { contractType: "VANILLALONGPUT", barrier: atmBarrier, duration, durationUnit, stake: safeStake, label: "ATM VANILLALONGPUT" },
   ];
 }
 
