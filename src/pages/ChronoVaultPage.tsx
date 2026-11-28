@@ -145,8 +145,8 @@ export default function ChronoVaultPage(props: Props): ReactElement {
     bindContractListener,
   } = props;
 
-  const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ10V");
-  const [weaponMode, setWeaponMode] = useState<ChronoWeaponMode>("auto_both");
+  const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ75V");
+  const [weaponMode, setWeaponMode] = useState<ChronoWeaponMode>("asian_impulse_only");
   const [baseLegStake, setBaseLegStake] = useState(CHRONO_MIN_STAKE);
   const [vaultEnabled, setVaultEnabled] = useState(true);
   const [vaultUnlockThreshold, setVaultUnlockThreshold] = useState(CHRONO_DEFAULT_VAULT_THRESHOLD);
@@ -351,14 +351,14 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       setRound(roundRef.current);
       if (activeChronoIdsRef.current.size === 0) {
         const net = round2(legs.reduce((sum, leg) => sum + leg.pnl, 0));
-        const outcome: ChronoOutcome = net >= 0.50
-          ? "DOUBLE-WIN CORRIDOR"
+        const outcome: ChronoOutcome = current.tier === 2
+          ? "VAULT CANNON HIT"
           : net > 0
-            ? "VAULT CANNON HIT"
-            : net > -0.10
+            ? "DOUBLE-WIN CORRIDOR"
+            : net >= -0.06
               ? "MICRO-SCRATCH"
               : "CORRIDOR MISS";
-        finalizeRound(current.tier === 2 && current.weapon === "ACCU 5% CANNON" ? "VAULT CANNON HIT" : outcome);
+        finalizeRound(outcome);
       }
     }
   }, [finalizeRound, sellContract]);
@@ -567,6 +567,14 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       durationUnit: request.durationUnit ?? "t",
       barrier: request.barrier,
     })));
+    const resetIndex = requests.findIndex((request) => request.contractType === "RESETCALL" || request.contractType === "RESETPUT");
+    if (resetIndex >= 0) {
+      const resetRequest = requests[resetIndex];
+      const resetQuote = quotes[resetIndex];
+      if (resetQuote && Number(resetQuote.payout) < resetRequest.stake * 1.75) {
+        throw new Error("RESET_PAYOUT_TOO_LOW: " + Number(resetQuote.payout).toFixed(2) + " / " + (resetRequest.stake * 1.75).toFixed(2));
+      }
+    }
     const legs = await Promise.all(quotes.map(async (quote, index) => {
       const contractId = await session.buy(quote.id, quote.ask);
       activeChronoIdsRef.current.add(contractId);
@@ -677,7 +685,12 @@ export default function ChronoVaultPage(props: Props): ReactElement {
       setRound(null);
       execRef.current = false;
       setExecuting(false);
-      onNotice("Chrono pair could not be placed: " + (error instanceof DerivError ? error.message : String(error)), "bad");
+      const message = error instanceof DerivError ? error.message : String(error);
+      if (message.includes("RESET_PAYOUT_TOO_LOW")) {
+        setPhase("RESET PAYOUT TOO LOW (<1.75x) · reset trade skipped");
+      } else {
+        onNotice("Chrono pair could not be placed: " + message, "bad");
+      }
     }
   }, [atr100, atr15, capabilities, onNotice, placeChronoPair]);
 

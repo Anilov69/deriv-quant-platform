@@ -13,10 +13,10 @@ import {
   PHOENIX_SYMBOLS,
   autoStopLoss,
   autoTakeProfit,
-  chooseImpulseDirection,
   cleanBarrierOffset,
   decimalsFromLatestQuote,
   formatBarrierOffset,
+  phoenixEntryGate,
   pipSizeFromDecimals,
   syntheticTouchOffset,
   gearRoundRisk,
@@ -177,7 +177,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const [logs, setLogs] = useState<PhoenixRoundLog[]>([]);
   const [pnl, setPnl] = useState(0);
   const [phase, setPhase] = useState("Warming the Phoenix market console.");
-  const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ10V");
+  const [selectedSymbol, setSelectedSymbol] = useState<string>("1HZ75V");
   const [capabilities, setCapabilities] = useState<Record<string, CapabilityRow>>({});
   const [history, setHistory] = useState<Tick[]>([]);
   const [warmBufferStatus, setWarmBufferStatus] = useState<string | null>(null);
@@ -224,6 +224,9 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const reqIdCounterRef = useRef(0);
   const cooldownTimerRef = useRef<number | undefined>(undefined);
   const gearRef = useRef<PhoenixGear>(1);
+  const runDecisionRef = useRef({ gear: 1 as PhoenixGear, reason: "Warming", reachable: false });
+  const fireRoundRef = useRef<(direction: "LONG" | "SHORT") => void>(() => undefined);
+  const touchOffsetRef = useRef(0);
 
   useEffect(() => {
     aliveRef.current = true;
@@ -250,7 +253,8 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     stagnationRef.current = stagnationTicks;
     stopLossRef.current = stopLoss;
     takeProfitRef.current = takeProfit;
-  }, [accountId, autoRouter, baseStake, connected, currency, dangerShield, dangerTriggerPct, primaryGear, selectedSymbol, stagnationTicks, stopLoss, takeProfit, trailingLock, turboStake]);
+    touchOffsetRef.current = touchOffset;
+  }, [accountId, autoRouter, baseStake, connected, currency, dangerShield, dangerTriggerPct, primaryGear, selectedSymbol, stagnationTicks, stopLoss, takeProfit, touchOffset, trailingLock, turboStake]);
 
   useEffect(() => {
     const gear = gearRef.current;
@@ -275,7 +279,8 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
 
   useEffect(() => {
     gearRef.current = runDecision.gear;
-  }, [runDecision.gear]);
+    runDecisionRef.current = runDecision;
+  }, [runDecision]);
 
   const stopEngine = useCallback((label: string) => {
     armedRef.current = false;
@@ -370,21 +375,30 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         const unrealized = bid - buyPrice;
         if (unrealized >= (payout - buyPrice) * 0.65) {
           sellContract(contractId);
-          roundRef.current = { ...roundRef.current, exitStatus: "RANGE 65% LOCK" };
+          roundRef.current = { ...roundRef.current, exitStatus: "TRAILING / RANGE LOCK" };
           setRound(roundRef.current);
         }
       }
 
       if (current.gear === 2 && trailingLockRef.current && numberFrom(data.is_valid_to_sell) === 1) {
         const peaked = peakBidRef.current.get(contractId) ?? 0;
-        if (peaked >= buyPrice * 1.50 && bid <= peaked * 0.80) sellContract(contractId);
-        if (current.ticksElapsed >= stagnationRef.current && bid < buyPrice * 1.15) sellContract(contractId);
+        const trailingHit = peaked >= buyPrice * 1.50 && bid <= peaked * 0.80;
+        const stagnationHit = current.ticksElapsed >= stagnationRef.current && bid < buyPrice * 1.15;
+        if (trailingHit || stagnationHit) {
+          sellContract(contractId);
+          roundRef.current = { ...roundRef.current, exitStatus: "TRAILING / RANGE LOCK" };
+          setRound(roundRef.current);
+        }
       }
 
       if (current.gear === 3) {
         const winning = roundRef.current.legs.find((item) => item.contractId === contractId);
         const straddleCost = roundRef.current.legs.reduce((sum, item) => sum + item.buyPrice, 0);
-        if (winning && bid >= straddleCost * 1.25) sellContract(contractId);
+        if (winning && bid >= straddleCost * 1.25) {
+          sellContract(contractId);
+          roundRef.current = { ...roundRef.current, exitStatus: "TRAILING / RANGE LOCK" };
+          setRound(roundRef.current);
+        }
       }
     }
 
@@ -398,14 +412,35 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       roundRef.current = { ...current, legs };
       setRound(roundRef.current);
       if (activePhoenixIdsRef.current.size === 0) {
-        let status: PhoenixExitStatus = roundRef.current.exitStatus;
-        if (current.gear === 2) {
-          const leg = legs.find((item) => item.contractType === "TURBOSLONG" || item.contractType === "TURBOSSHORT");
-          if (leg && leg.pnl > 0) status = "CLEAN RUNNER";
-          else if (leg && leg.bidPrice > 0 && leg.bidPrice < leg.buyPrice * 1.15) status = "CHOP SALVAGE";
+        const settledRound = roundRef.current;
+        const netPnl = round2(legs.reduce((sum, leg) => sum + leg.pnl, 0));
+        const directionalLeg = legs.find((leg) =>
+          leg.contractType === "CALL"
+          || leg.contractType === "PUT"
+          || leg.contractType === "TURBOSLONG"
+          || leg.contractType === "TURBOSSHORT"
+          || leg.contractType === "VANILLALONGCALL"
+          || leg.contractType === "VANILLALONGPUT",
+        );
+        const shieldLeg = legs.find((leg) => leg.contractType === "ONETOUCH" || leg.contractType === "NOTOUCH");
+        let status: PhoenixExitStatus;
+        if ((settledRound?.exitStatus === "TRAILING / RANGE LOCK" || settledRound?.exitStatus === "RANGE 65% LOCK") && netPnl > 0) {
+          status = "TRAILING / RANGE LOCK";
+        } else if (directionalLeg && shieldLeg) {
+          if (directionalLeg.pnl > 0 && shieldLeg.pnl > 0) status = "DOUBLE-DIP";
+          else if (directionalLeg.pnl <= 0 && shieldLeg.pnl > 0) status = "CRASH RESCUED";
+          else if (directionalLeg.pnl > 0 && shieldLeg.pnl <= 0) status = "MICRO-SCRATCH";
+          else status = "DOUBLE MISS";
+        } else if (current.gear === 3 && legs.length >= 2) {
+          status = legs.every((leg) => leg.pnl > 0) ? "DOUBLE-DIP" : legs.some((leg) => leg.pnl > 0) ? "PEEL LOCKED" : "DOUBLE MISS";
+        } else if (current.gear === 2) {
+          const turbo = legs.find((leg) => leg.contractType === "TURBOSLONG" || leg.contractType === "TURBOSSHORT");
+          status = turbo && turbo.pnl > 0 ? "CLEAN RUNNER" : "CHOP SALVAGE";
+        } else if (current.gear === 4) {
+          status = "TRAILING / RANGE LOCK";
+        } else {
+          status = netPnl > 0 ? "DOUBLE-DIP" : "DOUBLE MISS";
         }
-        if (current.gear === 3) status = legs.some((leg) => leg.pnl > 0) ? "PEEL LOCKED" : status;
-        if (current.gear === 4) status = roundRef.current.exitStatus === "RANGE 65% LOCK" ? "RANGE 65% LOCK" : "RANGE 65% LOCK";
         finalizeRound(status);
       }
     }
@@ -554,7 +589,6 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     if (!session) return;
     const handler = (symbol: string, tick: Tick): void => {
       if (symbol !== selectedRef.current) return;
-      const previous = ticksRef.current[ticksRef.current.length - 1]?.quote ?? tick.quote;
       const quote = Number(tick.quote);
       if (!Number.isFinite(quote) || quote <= 0) return;
       ticksRef.current = [...ticksRef.current.slice(-119), { ...tick, quote }];
@@ -575,8 +609,10 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         for (let index = 1; index < rows.length; index += 1) sum += Math.abs(rows[index] - rows[index - 1]);
         return sum / (rows.length - 1);
       };
-      setAtr15(range(quotes.slice(-15)));
-      setAtr100(range(quotes));
+      const atr15Live = range(quotes.slice(-15));
+      const atr100Live = range(quotes.slice(-100));
+      setAtr15(atr15Live);
+      setAtr100(atr100Live);
       const currentRound = roundRef.current;
       if (currentRound) {
         const nextRound = { ...currentRound, ticksElapsed: currentRound.ticksElapsed + 1 };
@@ -613,8 +649,17 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         setRound(nextRound);
       }
       if (armedRef.current && !execRef.current && !coolingRef.current) {
-        const direction = chooseImpulseDirection(tick.quote - previous, previous, tick.quote);
-        if (runDecision.reachable || runDecision.gear === 4) void fireRound(direction);
+        const quoteDecimals = decimalsFromLatestQuote(quote);
+        const barrierOffset = touchOffsetRef.current > 0
+          ? touchOffsetRef.current
+          : syntheticTouchOffset(atr15Live, pipSizeFromDecimals(quoteDecimals), quoteDecimals);
+        const gate = phoenixEntryGate(quotes, atr15Live, atr100Live, barrierOffset);
+        if (!gate.allowed) {
+          setPhase(gate.reason);
+        } else {
+          const direction = gate.impulseMove >= 0 ? "LONG" : "SHORT";
+          fireRoundRef.current(direction);
+        }
       }
     };
     session.onTickFor = handler;
@@ -861,6 +906,10 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       }
     }
   }, [connectedRef, onConnect, onNotice, placeBundle, resolveBarrier, runDecision, spot, touchOffset]);
+
+  useEffect(() => {
+    fireRoundRef.current = (direction) => { void fireRound(direction); };
+  }, [fireRound]);
 
   const armEngine = useCallback(() => {
     if (!connectedRef.current) { onConnect(); return; }

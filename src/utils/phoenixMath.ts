@@ -7,6 +7,9 @@ export type PhoenixExitStatus =
   | "PEEL LOCKED"
   | "RANGE 65% LOCK"
   | "CHOP SALVAGE"
+  | "MICRO-SCRATCH"
+  | "DOUBLE MISS"
+  | "TRAILING / RANGE LOCK"
   | "STEP 1 MISS"
   | "ROUND ACTIVE";
 
@@ -120,6 +123,33 @@ export function routePhoenixGear(
     return { gear: 4, reason: "DEAD CHOP · ROUTED TO RANGE BOX", reachable: false };
   }
   return { gear: primaryGear, reason: "AUTO ROUTER · VOLATILITY EXPANSION", reachable: true };
+}
+
+export interface PhoenixEntryGate {
+  allowed: boolean;
+  reason: string;
+  impulseMove: number;
+  efficiencyRatio3: number;
+}
+
+export function phoenixEntryGate(
+  latestQuotes: readonly number[],
+  atr15: number,
+  atr100: number,
+  touchBarrierOffset: number,
+): PhoenixEntryGate {
+  const recent = latestQuotes.slice(-4);
+  const impulseMove = recent.length === 4 ? recent[3] - recent[0] : 0;
+  let path = 0;
+  for (let index = 1; index < recent.length; index += 1) path += Math.abs(recent[index] - recent[index - 1]);
+  const efficiencyRatio3 = path > 0 ? Math.abs(impulseMove) / path : 0;
+  const expansion = atr100 > 0 && atr15 >= atr100 * 1.15;
+  const impulse = Math.abs(impulseMove) >= atr15 * 2.2 && efficiencyRatio3 >= 0.72;
+  const reachable = atr15 * 5 >= Math.abs(touchBarrierOffset);
+  if (!expansion) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION · VOLATILITY EXPANSION REQUIRED", impulseMove, efficiencyRatio3 };
+  if (!impulse) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION", impulseMove, efficiencyRatio3 };
+  if (!reachable) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION · BARRIER OUT OF REACH", impulseMove, efficiencyRatio3 };
+  return { allowed: true, reason: "3-TICK IMPULSE CONFIRMED", impulseMove, efficiencyRatio3 };
 }
 
 export function chooseImpulseDirection(spotMove: number, previousSpot: number, spot: number): "LONG" | "SHORT" {

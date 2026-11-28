@@ -48,7 +48,10 @@ export interface MicrostructureSignal {
   snapMove: number;
   momentumMove: number;
   efficiencyRatio: number;
+  momentumMove4: number;
+  efficiencyRatio4: number;
   atr15: number;
+  atr100: number;
 }
 
 export interface ChronoDecision {
@@ -110,15 +113,19 @@ export function safeEvenResetDuration(minTicks: number): number {
 
 export function analyzeMicrostructure(quotes: readonly number[]): MicrostructureSignal {
   const atr15 = atrFrom(quotes.slice(-15));
+  const atr100 = atrFrom(quotes.slice(-100));
   const recent3 = quotes.length >= 4 ? quotes.slice(-4) : [];
+  const recent4 = quotes.length >= 5 ? quotes.slice(-5) : [];
   const recent6 = quotes.length >= 6 ? quotes.slice(-6) : [];
   const momentumMove = recent3.length > 0 ? quotes[quotes.length - 1] - recent3[0] : 0;
+  const momentumMove4 = recent4.length > 0 ? quotes[quotes.length - 1] - recent4[0] : 0;
   const snapMove = recent6.length > 0 ? quotes[quotes.length - 1] - recent6[0] : 0;
   const er = efficiencyRatio(recent3);
+  const er4 = efficiencyRatio(recent4);
   let direction: ChronoDirection = "neutral";
-  if (momentumMove > 0) direction = "bullish";
-  else if (momentumMove < 0) direction = "bearish";
-  return { direction, snapMove, momentumMove, efficiencyRatio: er, atr15 };
+  if (momentumMove4 > 0) direction = "bullish";
+  else if (momentumMove4 < 0) direction = "bearish";
+  return { direction, snapMove, momentumMove, efficiencyRatio: er, momentumMove4, efficiencyRatio4: er4, atr15, atr100 };
 }
 
 export function chooseChronoWeapon(
@@ -127,9 +134,11 @@ export function chooseChronoWeapon(
   resetTickSupported: boolean,
 ): ChronoDecision {
   const absoluteSnap = Math.abs(signal.snapMove);
-  const absoluteMomentum = Math.abs(signal.momentumMove);
+  const absoluteMomentum = Math.abs(signal.momentumMove4);
+  const impulseExpansion = signal.atr100 > 0 && signal.atr15 >= signal.atr100 * 1.10;
+  const impulseEligible = impulseExpansion && signal.efficiencyRatio4 >= 0.78 && absoluteMomentum >= signal.atr15 * 2.4;
   if (mode === "asian_impulse_only") {
-    const eligible = signal.efficiencyRatio >= 0.70 && absoluteMomentum >= 1.1 * signal.atr15;
+    const eligible = impulseEligible;
     if (!eligible) return { weapon: null, direction: "neutral", reason: "Impulse filter not met" };
     return signal.direction === "bullish"
       ? { weapon: "CALL+ASIAND", direction: "bullish", reason: "Bullish clean momentum burst" }
@@ -154,7 +163,7 @@ export function chooseChronoWeapon(
         ? { weapon: "RESETPUT+CALL", direction: "bearish", reason: "Weapon A · bearish reset exhaustion" }
         : { weapon: null, direction: "neutral", reason: "Neutral reset snap" };
   }
-  if (signal.efficiencyRatio >= 0.70 && absoluteMomentum >= 1.1 * signal.atr15) {
+  if (impulseEligible) {
     return signal.direction === "bullish"
       ? { weapon: "CALL+ASIAND", direction: "bullish", reason: "Weapon B · bullish momentum burst" }
       : signal.direction === "bearish"
