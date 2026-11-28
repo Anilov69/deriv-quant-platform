@@ -511,7 +511,10 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       const minDurationByType: Record<string, string> = {};
       for (const offer of offers) {
         const contractType = offer.contractType.toUpperCase();
-        if (offer.defaultStake > 0) minStakeByType[contractType] = offer.defaultStake;
+        const discoveredMinimum = typeof offer.minContractStake === "number" && offer.minContractStake > 0
+          ? offer.minContractStake
+          : offer.defaultStake;
+        if (discoveredMinimum > 0) minStakeByType[contractType] = Math.min(minStakeByType[contractType] ?? discoveredMinimum, discoveredMinimum);
         if (offer.minContractDuration) minDurationByType[contractType] = offer.minContractDuration;
         const choices = [...(offer.barrier ? [offer.barrier] : []), ...(offer.barrierChoices ?? [])]
           .map((choice) => String(choice).trim())
@@ -760,8 +763,10 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     const pipSize = pipSizeFromDecimals(decimals);
 
     if (side === "atm") {
-      const atm = choices.find((choice) => Number(choice.replace(/[^0-9.-]/g, "")) === 0)
-        ?? choices.find((choice) => choice === "+0.0" || choice === "0.0" || choice === "0")
+      const nonEmpty = choices.map((choice) => String(choice).trim()).filter((choice) => choice.length > 0);
+      const atm = nonEmpty.find((choice) => choice === "+0.0")
+        ?? nonEmpty.find((choice) => choice === "0.0" || choice === "0")
+        ?? nonEmpty.sort((a, b) => Math.abs(parseFloat(a)) - Math.abs(parseFloat(b)))[0]
         ?? "+0.0";
       return String(atm).trim();
     }
@@ -772,6 +777,15 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
       .sort((a, b) => a.value - b.value);
 
     if (side === "ko") {
+      const typeChoices = row?.barrierChoicesByType[contractType] ?? numericChoices.map((choice) => choice.raw);
+      const parsedChoices = typeChoices
+        .map((choice) => ({ raw: choice, value: cleanBarrierOffset(choice, decimals) }))
+        .filter((choice) => choice.value >= pipSize * 5)
+        .sort((a, b) => a.value - b.value);
+      if (parsedChoices.length > 0) {
+        const widestBarrier = parsedChoices[parsedChoices.length - 1];
+        return formatBarrierOffset(widestBarrier.raw, decimals, true);
+      }
       if (numericChoices.length > 0) return formatBarrierOffset(numericChoices[numericChoices.length - 1].raw, decimals, true);
       return formatBarrierOffset(pipSize * 20, decimals, true);
     }
@@ -1013,10 +1027,11 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
         const ko = cleanBarrierOffset(koBarrier, decimals);
         const discoveredTouchBarrier = resolveBarrier(symbol, "ONETOUCH", "touch", spotNow, atr15Now);
         const discoveredTouch = cleanBarrierOffset(discoveredTouchBarrier, decimals);
-        const minimumInterior = Math.max(pipSize * 20, atr15Now * 1.8);
+        const baseTouch = Math.max(pipSize * 20, atr15Now * 1.8);
+        const safeTouchOffset = Math.min(baseTouch, Math.max(pipSize * 10, ko * 0.45));
         const maxInterior = ko - pipSize;
-        if (maxInterior < minimumInterior) throw new Error("No interior ONETOUCH barrier is safely inside the selected Turbo KO barrier.");
-        const touch = Math.min(maxInterior, Math.max(minimumInterior, discoveredTouch));
+        if (maxInterior < Math.max(pipSize * 10, safeTouchOffset)) throw new Error("No interior ONETOUCH barrier is safely inside the selected Turbo KO barrier.");
+        const touch = Math.min(maxInterior, Math.max(pipSize * 10, Math.min(safeTouchOffset, discoveredTouch || Number.POSITIVE_INFINITY)));
         const touchBarrier = formatBarrierOffset(touch, decimals, true);
         const signedKo = ko * (koBarrier.trim().startsWith("-") ? -1 : 1);
         const signedTouch = touch * (touchBarrier.trim().startsWith("-") ? -1 : 1);
@@ -1045,8 +1060,20 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
           discoveredVanillaMinStakeRef.current[symbol] ?? 1,
         );
         const effectiveVanillaStake = Math.max(baseRef.current, vanillaMinimum);
-        const callDuration = parsePhoenixDuration(capabilities[symbol]?.minDurationByType.VANILLALONGCALL);
-        const putDuration = parsePhoenixDuration(capabilities[symbol]?.minDurationByType.VANILLALONGPUT);
+        const parseVanillaDuration = (raw: string | undefined): { duration: number; durationUnit: "t" | "s" | "m" } => {
+          if (!raw) return { duration: 1, durationUnit: "m" };
+          const match = raw.trim().match(/^(\d+)([tsmhd])$/i);
+          if (!match) return { duration: 1, durationUnit: "m" };
+          const duration = Number(match[1]);
+          const durationUnit = match[2].toLowerCase();
+          if (!Number.isFinite(duration) || duration <= 0) return { duration: 1, durationUnit: "m" };
+          if (durationUnit === "t" || durationUnit === "s" || durationUnit === "m") {
+            return { duration, durationUnit };
+          }
+          return { duration: 1, durationUnit: "m" };
+        };
+        const callDuration = parseVanillaDuration(capabilities[symbol]?.minDurationByType.VANILLALONGCALL);
+        const putDuration = parseVanillaDuration(capabilities[symbol]?.minDurationByType.VANILLALONGPUT);
         const requests = vanillaRequests(effectiveVanillaStake, atmCallBarrier).map((request, index) => {
           const duration = index === 0 ? callDuration : putDuration;
           return {

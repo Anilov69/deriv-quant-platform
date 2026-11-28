@@ -103,6 +103,8 @@ interface QuantPosition {
   watchId: string;
   status: string;
   profit: number | null;
+  remainingTicks: number;
+  peakBidProfit: number;
 }
 
 interface QuantQuoteSnapshot {
@@ -252,15 +254,17 @@ function initialStake(
   mode: "kelly" | "fixed",
   fixedStake: number,
   snapshot: QuantQuoteSnapshot | null,
+  sessionPnl = 0,
 ): number {
   const quote = snapshot && snapshot.key === plan.key ? snapshot.quote : { ask: QUANT_MIN_STAKE, payout: QUANT_MIN_STAKE * 2 };
-  return sizeQuantStake({
+  const scaled = sizeQuantStake({
     mode,
     balance: balance ?? 0,
     quote,
     pRealized: plan.pRealized,
     fixedStake,
   });
+  return sessionPnl >= 0.50 ? scaled : QUANT_MIN_STAKE;
 }
 
 function quoteRequestFor(plan: QuantTradePlan, stake: number, currency: string): QuoteRequest {
@@ -709,7 +713,7 @@ export default function QuantDeskPage({
     if (now - lastAttempt < 2_500) return;
     const session = sessionRef.current;
     if (!session) return;
-    const stake = initialStake(plan, balanceRef.current, sizingModeRef.current, fixedStakeRef.current, snapshot ?? null);
+    const stake = initialStake(plan, balanceRef.current, sizingModeRef.current, fixedStakeRef.current, snapshot ?? null, pnlRef.current);
     quoteBusyRef.current = true;
     setQuoteScanning(true);
     lastQuoteAttemptRef.current.set(symbol, now);
@@ -765,7 +769,7 @@ export default function QuantDeskPage({
     const accountAtStart = accountIdRef.current;
     try {
       let planNow = initialPlan;
-      let stake = initialStake(planNow, balanceRef.current, sizingModeRef.current, fixedStakeRef.current, quotesRef.current.get(symbol) ?? null);
+      let stake = initialStake(planNow, balanceRef.current, sizingModeRef.current, fixedStakeRef.current, quotesRef.current.get(symbol) ?? null, pnlRef.current);
       let quote = await session.quote(quoteRequestFor(planNow, stake, currencyRef.current || "USD"));
       let currentPlan = plansRef.current.get(symbol);
       if (!currentPlan || currentPlan.key !== planNow.key) {
@@ -780,6 +784,8 @@ export default function QuantDeskPage({
         pRealized: planNow.pRealized,
         fixedStake: fixedStakeRef.current,
       });
+      if (pnlRef.current < 0.50) desired = QUANT_MIN_STAKE;
+      if (pnlRef.current < 0.50) desired = QUANT_MIN_STAKE;
       if (Math.abs(desired - stake) >= 0.01) {
         stake = desired;
         quote = await session.quote(quoteRequestFor(planNow, stake, currencyRef.current || "USD"));
@@ -886,6 +892,8 @@ export default function QuantDeskPage({
         watchId: "",
         status: "open",
         profit: null,
+        remainingTicks: planNow.unit === "t" ? planNow.duration : Math.max(1, planNow.duration * 60),
+        peakBidProfit: 0,
       };
       activeRef.current = position;
       setActive(position);
@@ -931,7 +939,7 @@ export default function QuantDeskPage({
   }, [clearSettlementTimer, lockEngine, onNotice, publishRows, sessionRef, showAdvisor]);
 
   const triggerSell = useCallback((position: QuantPosition) => {
-    if (position.sellAcknowledged || position.sellInFlight || position.sellBlocked || position.sellAttempts >= 3) return;
+    if (position.isSold || position.remainingTicks <= 1 || position.sellAcknowledged || position.sellInFlight || position.sellBlocked || position.sellAttempts >= 3) return;
     const session = sessionRef.current;
     if (!session) return;
     const attempt = position.sellAttempts + 1;
@@ -968,12 +976,17 @@ export default function QuantDeskPage({
         };
         activeRef.current = failed;
         setActive(failed);
+        const detail = describeError(error);
+        if (/not found among your open positions/i.test(detail)) {
+          setPhase("Sell already settled or contract disappeared — awaiting expiry confirmation.");
+          return;
+        }
         if (blocked) {
           setPhase("Early sell was rejected three times; holding to expiry.");
         } else {
-          setPhase("Early sell rejected: " + describeError(error) + ". Will retry on a later bid.");
+          setPhase("Early sell rejected: " + detail + ". Will retry on a later bid.");
         }
-        onNotice("Early-exit sell rejected: " + describeError(error), "bad");
+        onNotice("Early-exit sell rejected: " + detail, "bad");
       });
   }, [onNotice, sessionRef]);
 
@@ -1046,16 +1059,24 @@ export default function QuantDeskPage({
       finalizePosition(current, frame);
       return;
     }
+    const elapsedSeconds = Math.floor((Date.now() - current.openedAt) / 1000);
+    const remainingTicks = current.unit === "t"
+      ? Math.max(0, current.duration - elapsedSeconds)
+      : Math.max(0, current.duration * 60 - elapsedSeconds);
+    const buyPrice = frame.buyPrice > 0 ? frame.buyPrice : current.buyPrice;
+    const unrealized = frame.bidPrice - buyPrice;
     const next: QuantPosition = {
       ...current,
-      buyPrice: frame.buyPrice > 0 ? frame.buyPrice : current.buyPrice,
+      buyPrice,
       payout: frame.payout > 0 ? frame.payout : current.payout,
       bidPrice: frame.bidPrice,
-      unrealized: frame.bidPrice - (frame.buyPrice > 0 ? frame.buyPrice : current.buyPrice),
+      unrealized,
       isValidToSell: frame.isValidToSell,
       isSold: false,
       status: frame.status || current.status,
       profit: frame.profit,
+      remainingTicks,
+      peakBidProfit: Math.max(current.peakBidProfit, unrealized),
     };
     activeRef.current = next;
     setActive(next);
@@ -1067,6 +1088,9 @@ export default function QuantDeskPage({
       bidPrice: next.bidPrice,
       isValidToSell: next.isValidToSell,
       isSold: false,
+      contract: next.contract,
+      peakBidProfit: next.peakBidProfit,
+      remainingTicks: next.remainingTicks,
     })) {
       triggerSell(next);
     }
@@ -1637,7 +1661,7 @@ export default function QuantDeskPage({
               <article className="rounded border border-emerald-400/25 bg-emerald-400/[0.04] p-2.5">
                 <p className="font-mono text-[8px] tracking-widest text-emerald-300">01 · VOLATILITY VACUUM</p>
                 <p className="mt-1 text-[10px] font-semibold text-slate-100">1HZ* · ATR15/ATR100 ≤ 0.65 · H &lt; 0.45</p>
-                <p className="mt-1 text-[9px] leading-relaxed text-muted">Sell NOTOUCH at the fastest valid duration and barrier. Survival is measured across the last 100 matching windows, clamped 50%–92%.</p>
+                <p className="mt-1 text-[9px] leading-relaxed text-muted">Sell 10t NOTOUCH (or the broker minimum if greater), using the analytical reflection probability blended 70/30 with Beta-Binomial survival, clamped 50%–92%.</p>
               </article>
               <article className="rounded border border-sky-400/25 bg-sky-400/[0.04] p-2.5">
                 <p className="font-mono text-[8px] tracking-widest text-sky-300">02 · LOCKED DRIFT</p>
@@ -1646,8 +1670,8 @@ export default function QuantDeskPage({
               </article>
               <article className="rounded border border-fuchsia-400/25 bg-fuchsia-400/[0.04] p-2.5">
                 <p className="font-mono text-[8px] tracking-widest text-fuchsia-300">03 · POST-JUMP CALM</p>
-                <p className="mt-1 text-[10px] font-semibold text-slate-100">JD75/JD100 · ticksSinceJump ≤ 2</p>
-                <p className="mt-1 text-[9px] leading-relaxed text-muted">A jump is a single tick ≥ 18× the 100-tick median range. Fade the discharged move with CALL/PUT, or take NOTOUCH when its EV survives the gate.</p>
+                <p className="mt-1 text-[10px] font-semibold text-slate-100">JD10/JD25/JD50/JD75/JD100 · ticksSinceJump ≤ 2</p>
+                <p className="mt-1 text-[9px] leading-relaxed text-muted">A ≥18× jump spike prioritizes 10t NOTOUCH for post-jump volatility crush, then fades with CALL/PUT if NOTOUCH cannot clear EV.</p>
               </article>
               <article className="rounded border border-amber-400/25 bg-amber-400/[0.04] p-2.5">
                 <p className="font-mono text-[8px] tracking-widest text-amber-300">04 · COIL BREAKOUT</p>

@@ -24,9 +24,9 @@ export const QUANT_UNIVERSE: readonly QuantMarket[] = [
   { symbol: "1HZ50V", label: "1HZ50V", family: "volatility" },
   { symbol: "1HZ75V", label: "1HZ75V", family: "volatility" },
   { symbol: "1HZ100V", label: "1HZ100V", family: "volatility" },
-  { symbol: "DSI10", label: "DSI10", family: "drift" },
-  { symbol: "DSI20", label: "DSI20", family: "drift" },
-  { symbol: "DSI30", label: "DSI30", family: "drift" },
+  { symbol: "JD10", label: "JD10", family: "jump" },
+  { symbol: "JD25", label: "JD25", family: "jump" },
+  { symbol: "JD50", label: "JD50", family: "jump" },
   { symbol: "JD75", label: "JD75", family: "jump" },
   { symbol: "JD100", label: "JD100", family: "jump" },
 ] as const;
@@ -314,7 +314,7 @@ export function classifyQuantRegime(features: QuantFeatures, symbol: string): Qu
   if (selected === 3) {
     const direction: -1 | 1 = features.jumpDirection === 1 ? -1 : 1;
     return {
-      regime: 3, key: "post_jump", label: REGIME_LABELS[3], contract: direction > 0 ? "CALL" : "PUT", preferredContracts: [direction > 0 ? "CALL" : "PUT", "NOTOUCH"], direction,
+      regime: 3, key: "post_jump", label: REGIME_LABELS[3], contract: "NOTOUCH", preferredContracts: ["NOTOUCH", direction > 0 ? "CALL" : "PUT"], direction,
       posterior: clamp(posterior, 0, 1),
       condition: "JD index with ticksSinceJump <= 2; fade the discharged jump or use NOTOUCH",
     };
@@ -491,7 +491,12 @@ function chooseRoute(signal: QuantRegimeSignal, capabilities: QuantCapabilities)
   for (const contract of signal.preferredContracts) {
     const capability = capabilities[contract];
     if (!capability) continue;
-    if (signal.regime === 2) {
+    if (contract === "NOTOUCH" && (signal.regime === 1 || signal.regime === 3)) {
+      if (capability.duration.unit !== "t") continue;
+      if (capability.maxDuration.unit !== "t" || capability.maxDuration.value < 10) continue;
+      return { contract, capability, duration: 10, unit: "t" };
+    }
+    if (signal.regime === 2 || contract === "ONETOUCH") {
       if (capability.duration.unit !== "t") continue;
       if (capability.duration.value > 5 || capability.maxDuration.value < 5 || capability.maxDuration.unit !== "t") continue;
       return { contract, capability, duration: 5, unit: "t" };
@@ -594,6 +599,35 @@ function directionalFrequency(history: readonly Tick[], horizon: number, directi
   return samples >= 8 ? matches / samples : null;
 }
 
+export function normalCdf(value: number): number {
+  if (!Number.isFinite(value)) return value > 0 ? 1 : 0;
+  const sign = value < 0 ? -1 : 1;
+  const x = Math.abs(value) / Math.sqrt(2);
+  const t = 1 / (1 + 0.3275911 * x);
+  const coefficients = [0.254829592, -0.284496736, 1.421413741, -1.453152027, 0.284496736];
+  const erfApprox = 1 - (((((coefficients[4] * t + coefficients[3]) * t + coefficients[2]) * t + coefficients[1]) * t + coefficients[0]) * t * Math.exp(-x * x));
+  return clamp(0.5 * (1 + sign * erfApprox), 0, 1);
+}
+
+export function betaBinomialShrunk(successes: number, windows: number, prior = 0.5): number {
+  const safeSuccesses = Math.max(0, successes);
+  const safeWindows = Math.max(0, windows);
+  return (safeSuccesses + 20 * prior) / (safeWindows + 20);
+}
+
+export function analyticalBarrierProbability(history: readonly Tick[], kind: "NOTOUCH" | "ONETOUCH", horizon: number, offset: number): number {
+  const prices = cleanHistory(history).map((tick) => tick.quote);
+  const changes = absoluteChanges(prices);
+  const tail = changes.slice(-25);
+  if (tail.length === 0 || offset <= 0) return kind === "NOTOUCH" ? 0.6 : 0.55;
+  const mean = tail.reduce((sum, value) => sum + value, 0) / tail.length;
+  const variance = tail.reduce((sum, value) => sum + (value - mean) ** 2, 0) / tail.length;
+  const sigmaRealized = Math.sqrt(variance);
+  if (!finite(sigmaRealized) || sigmaRealized <= MIN_RANGE) return kind === "NOTOUCH" ? 0.6 : 0.55;
+  const pTouch = clamp(2 * normalCdf(-offset / (sigmaRealized * Math.sqrt(Math.max(1, horizon)))), 0, 1);
+  return kind === "NOTOUCH" ? 1 - pTouch : pTouch;
+}
+
 function onetouchFrequency(history: readonly Tick[], horizon: number, direction: -1 | 0 | 1, offset: number): number | null {
   if (history.length < horizon + 8 || offset <= 0 || direction === 0) return null;
   const lastStart = history.length - horizon - 1;
@@ -620,16 +654,32 @@ export function estimateQuantRealizedProbability(input: RealizedProbabilityInput
   let raw: number | null = null;
   if (input.kind === "NOTOUCH") {
     raw = notouchSurvival(history, horizon, input.barrierOffset);
-    return clamp(raw ?? 0.6, 0.5, 0.92);
+    const analytical = analyticalBarrierProbability(history, "NOTOUCH", horizon, input.barrierOffset);
+    if (raw !== null) {
+      const empiricalSurvival = betaBinomialShrunk(Math.round(raw * 100), 100, analytical);
+      const blended = 0.70 * analytical + 0.30 * empiricalSurvival;
+      return clamp(blended, 0.5, 0.92);
+    }
+    return clamp(0.70 * analytical + 0.30 * betaBinomialShrunk(0, 0, analytical), 0.5, 0.92);
   }
   if (input.kind === "ONETOUCH") {
     raw = onetouchFrequency(history, horizon, input.direction, input.barrierOffset);
-    return clamp(raw ?? 0.55, 0.35, 0.88);
+    const analytical = analyticalBarrierProbability(history, "ONETOUCH", horizon, input.barrierOffset);
+    if (raw !== null) {
+      const empiricalHits = betaBinomialShrunk(Math.round(raw * 100), 100, analytical);
+      const blended = 0.70 * analytical + 0.30 * empiricalHits;
+      return clamp(blended, 0.35, 0.88);
+    }
+    return clamp(0.70 * analytical + 0.30 * betaBinomialShrunk(0, 0, analytical), 0.35, 0.88);
   }
   raw = directionalFrequency(history, Math.max(2, horizon), input.direction);
-  if (input.regime === 2) return clamp(raw ?? 0.55, 0.45, 0.72);
-  if (input.regime === 3) return clamp(raw ?? 0.56, 0.5, 0.78);
-  return clamp(raw ?? 0.52, 0.45, 0.72);
+  if (raw !== null) {
+    const shrunk = betaBinomialShrunk(Math.round(raw * Math.max(8, 120)), 120, 0.5);
+    if (input.regime === 2) return clamp(shrunk, 0.45, 0.72);
+    if (input.regime === 3) return clamp(shrunk, 0.5, 0.78);
+    return clamp(shrunk, 0.45, 0.72);
+  }
+  return clamp(0.55, 0.45, 0.72);
 }
 
 export interface QuantQuoteMetrics {
@@ -700,13 +750,23 @@ export interface HarvestDecisionInput {
   bidPrice: number;
   isValidToSell: boolean;
   isSold: boolean;
+  contract?: QuantContractKind;
+  peakBidProfit?: number;
+  remainingTicks?: number;
 }
 
 export function shouldHarvest(input: HarvestDecisionInput): boolean {
-  if (!input.enabled || input.isSold || !input.isValidToSell || input.buyPrice <= 0 || input.payout <= 0) return false;
+  const remainingTicks = input.remainingTicks ?? Number.POSITIVE_INFINITY;
+  if (!input.enabled || input.isSold || remainingTicks <= 1 || !input.isValidToSell || input.buyPrice <= 0 || input.payout <= 0) return false;
   const maxNetProfit = input.payout - input.buyPrice;
   const unrealized = input.bidPrice - input.buyPrice;
   const target = maxNetProfit * clamp(input.targetCapturePct, QUANT_CAPTURE_FLOOR, QUANT_CAPTURE_CEILING) / 100;
+  if (input.contract === "ONETOUCH") {
+    const peakProfit = Math.max(input.peakBidProfit ?? 0, unrealized);
+    if (peakProfit < maxNetProfit * 0.60) return false;
+    const floor = peakProfit * 0.85;
+    return unrealized >= 0.04 && unrealized >= floor;
+  }
   return maxNetProfit > 0 && unrealized >= 0.04 && unrealized >= target;
 }
 

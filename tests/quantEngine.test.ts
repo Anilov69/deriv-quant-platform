@@ -138,8 +138,8 @@ describe("Bayesian regime router", () => {
   it("fades a fresh jump in the opposite direction on JD symbols", () => {
     const signal = classifyQuantRegime(features({ ticksSinceJump: 1, jumpDirection: 1, atrRatio: 1, hurst: 0.5 }), "JD75");
     expect(signal?.regime).toBe(3);
-    expect(signal?.contract).toBe("PUT");
-    expect(signal?.preferredContracts).toEqual(["PUT", "NOTOUCH"]);
+    expect(signal?.contract).toBe("NOTOUCH");
+    expect(signal?.preferredContracts).toEqual(["NOTOUCH", "PUT"]);
   });
 
   it("routes expansion after compression to ONETOUCH in the impulse direction", () => {
@@ -183,7 +183,7 @@ describe("contract capability router", () => {
     expect(signal).not.toBeNull();
     const plan = buildQuantTradePlan({ symbol: "1HZ100V", features: features({ atrRatio: 0.5, hurst: 0.3, atr15: 0.1 }), signal: signal!, capabilities: capabilities(), history });
     expect(plan?.contract).toBe("NOTOUCH");
-    expect(plan?.duration).toBe(1);
+    expect(plan?.duration).toBe(10);
     expect(plan?.unit).toBe("t");
     expect(plan?.barrier).toBe("+0.50");
     expect(plan?.pRealized).toBeGreaterThanOrEqual(0.5);
@@ -192,8 +192,8 @@ describe("contract capability router", () => {
 
   it("forces the locked-drift weapon onto the 5-tick horizon", () => {
     const history = makeTicks(Array.from({ length: 150 }, (_, index) => 1000 + index * 0.1));
-    const signal = classifyQuantRegime(features({ efficiency30: 0.8, hurst: 0.7, change30: 4 }), "DSI20");
-    const plan = buildQuantTradePlan({ symbol: "DSI20", features: features({ efficiency30: 0.8, hurst: 0.7, change30: 4 }), signal: signal!, capabilities: capabilities(), history });
+    const signal = classifyQuantRegime(features({ efficiency30: 0.8, hurst: 0.7, change30: 4 }), "1HZ50V");
+    const plan = buildQuantTradePlan({ symbol: "1HZ50V", features: features({ efficiency30: 0.8, hurst: 0.7, change30: 4 }), signal: signal!, capabilities: capabilities(), history });
     expect(plan?.duration).toBe(5);
     expect(plan?.unit).toBe("t");
     expect(plan?.barrier).toBeNull();

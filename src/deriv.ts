@@ -77,6 +77,7 @@ export interface ContractOffer {
   barrier: string | null;
   barrierChoices?: string[];
   defaultStake: number;
+  minContractStake?: number;
   pipSize: number;
   underlyingSymbol: string;
 }
@@ -383,6 +384,7 @@ export class DerivSession {
         barrier,
         barrierChoices,
         defaultStake: num(item.default_stake),
+        minContractStake: num(item.min_contract_stake),
         pipSize: num(item.pip_size),
         underlyingSymbol: String(item.underlying_symbol ?? symbol),
       };

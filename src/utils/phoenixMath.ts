@@ -146,9 +146,9 @@ export function phoenixEntryGate(
   const expansion = atr100 > 0 && atr15 >= atr100 * 0.90;
   const impulse = Math.abs(impulseMove) >= atr15 * 1.55 && efficiencyRatio3 >= 0.65;
   const reachable = atr15 * 5 >= Math.abs(touchBarrierOffset);
-  if (!expansion) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION · VOLATILITY EXPANSION REQUIRED", impulseMove, efficiencyRatio3 };
-  if (!impulse) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION", impulseMove, efficiencyRatio3 };
-  if (!reachable) return { allowed: false, reason: "WAITING FOR 2.2x ATR IMPULSE & EXPANSION · BARRIER OUT OF REACH", impulseMove, efficiencyRatio3 };
+  if (!expansion) return { allowed: false, reason: "WAITING FOR 1.55x ATR IMPULSE · VOLATILITY EXPANSION REQUIRED", impulseMove, efficiencyRatio3 };
+  if (!impulse) return { allowed: false, reason: "WAITING FOR 1.55x ATR IMPULSE", impulseMove, efficiencyRatio3 };
+  if (!reachable) return { allowed: false, reason: "WAITING FOR 1.55x ATR IMPULSE · BARRIER OUT OF REACH", impulseMove, efficiencyRatio3 };
   return { allowed: true, reason: "3-TICK IMPULSE CONFIRMED", impulseMove, efficiencyRatio3 };
 }
 
