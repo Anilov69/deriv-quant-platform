@@ -15,7 +15,10 @@ import {
   autoTakeProfit,
   chooseImpulseDirection,
   cleanBarrierOffset,
+  decimalsFromLatestQuote,
   formatBarrierOffset,
+  pipSizeFromDecimals,
+  syntheticTouchOffset,
   gearRoundRisk,
   microPhoenixRequests,
   phoenixCsv,
@@ -212,6 +215,7 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
   const roundSeqRef = useRef(0);
   const activePhoenixIdsRef = useRef<Set<number>>(new Set<number>());
   const peakBidRef = useRef<Map<number, number>>(new Map<number, number>());
+  const validatedTouchOffsetRef = useRef<Record<string, number>>({});
   const buyPriceRef = useRef<Map<number, number>>(new Map<number, number>());
   const sellSentRef = useRef<Set<number>>(new Set<number>());
   const ticksRef = useRef<Tick[]>([]);
@@ -631,10 +635,8 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     const choices = row?.barrierChoicesByType[
       contractType === "VANILLA" ? "VANILLALONGCALL" : contractType
     ] ?? row?.barriers ?? [];
-    const pip = symbols.find((item) => item.symbol === symbol)?.pip;
-    const decimals = pip && pip > 0
-      ? Math.max(0, Math.min(8, Math.ceil(-Math.log10(pip))))
-      : 2;
+    const decimals = decimalsFromLatestQuote(spot);
+    const pipSize = pipSizeFromDecimals(decimals);
 
     if (side === "atm") {
       const atm = choices.find((choice) => Number(choice.replace(/[^0-9.-]/g, "")) === 0)
@@ -645,24 +647,36 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
 
     const numericChoices = choices
       .map((choice) => ({ raw: choice, value: cleanBarrierOffset(choice, decimals) }))
-      .filter((choice) => choice.value > 0)
+      .filter((choice) => choice.value >= pipSize * 5)
       .sort((a, b) => a.value - b.value);
 
     if (side === "ko") {
       if (numericChoices.length > 0) return formatBarrierOffset(numericChoices[numericChoices.length - 1].raw, decimals, true);
-      return "+0.001";
+      return formatBarrierOffset(pipSize * 20, decimals, true);
     }
 
     const koAbs = Math.abs(koOffset);
     const inside = numericChoices
-      .filter((choice) => choice.value > 0 && (koAbs <= 0 || choice.value < koAbs))
+      .filter((choice) => choice.value >= pipSize * 5 && (koAbs <= 0 || choice.value < koAbs))
       .sort((a, b) => a.value - b.value);
+
     if (inside.length > 0) {
       const desired = inside[Math.floor(inside.length / 2)]?.raw ?? inside[0].raw;
-      return formatBarrierOffset(desired, decimals, true);
+      const validated = validatedTouchOffsetRef.current[symbol];
+      const desiredOffset = cleanBarrierOffset(desired, decimals);
+      const maxInterior = koAbs > 0 ? koAbs * 0.75 : desiredOffset;
+      const workingOffset = validated && validated > 0
+        ? Math.min(maxInterior, Math.max(validated, pipSize * 20))
+        : Math.min(maxInterior, desiredOffset);
+      return formatBarrierOffset(workingOffset, decimals, true);
     }
-    return "+0.0005";
-  }, [capabilities, koOffset, symbols]);
+
+    const validated = validatedTouchOffsetRef.current[symbol];
+    const synthetic = syntheticTouchOffset(atr15, pipSize, decimals, validated);
+    const koLimited = koAbs > 0 ? Math.min(synthetic, koAbs * 0.75) : synthetic;
+    const safeOffset = Math.min(koAbs > 0 ? koAbs * 0.75 : Number.MAX_SAFE_INTEGER, Math.max(pipSize * 20, koLimited));
+    return formatBarrierOffset(safeOffset, decimals, true);
+  }, [atr15, capabilities, koOffset, spot]);
 
   const placeBundle = useCallback(async (symbol: string, gear: PhoenixGear, requests: PhoenixLegRequest[]): Promise<void> => {
     const session = sessionRef.current;
@@ -702,13 +716,54 @@ export default function PhoenixEnginePage(props: Props): ReactElement {
     });
 
     let quotes;
-    try {
-      quotes = await session.quoteBundle(payloadRequests);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      const failedRequest = payloadRequests.find((request) => request.contract !== "CALL" && request.contract !== "PUT") ?? payloadRequests[0];
-      const failedBarrier = typeof failedRequest?.barrier === "string" ? failedRequest.barrier : "<none>";
-      throw new Error(failedRequest.contract + " (" + failedBarrier + "): " + detail);
+    const barrierContractIndex = payloadRequests.findIndex((request) => request.contract === "ONETOUCH" || request.contract === "NOTOUCH");
+
+    if (barrierContractIndex >= 0) {
+      let workingPayloads = payloadRequests;
+      let escalation = 1;
+      let lastError: unknown = null;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+          quotes = await session.quoteBundle(workingPayloads);
+          const workingRequest = workingPayloads[barrierContractIndex];
+          if (typeof workingRequest?.barrier === "string") {
+            const workingOffset = cleanBarrierOffset(workingRequest.barrier, decimalsFromLatestQuote(spot));
+            if (workingOffset > 0) validatedTouchOffsetRef.current[symbol] = workingOffset;
+          }
+          lastError = null;
+          break;
+        } catch (error) {
+          lastError = error;
+          const detail = error instanceof Error ? error.message : String(error);
+          const distanceError = /away from the spot|pip|barrier.*distance|minimum.*barrier/i.test(detail);
+          if (!distanceError || attempt >= 3) break;
+
+          escalation *= 2.5;
+          const decimals = decimalsFromLatestQuote(spot);
+          workingPayloads = workingPayloads.map((request) => {
+            if (request.contract !== "ONETOUCH" && request.contract !== "NOTOUCH") return request;
+            if (typeof request.barrier !== "string") return request;
+            const currentOffset = cleanBarrierOffset(request.barrier, decimals);
+            const nextOffset = Number((currentOffset * escalation).toFixed(decimals));
+            return { ...request, barrier: formatBarrierOffset(nextOffset, decimals, request.barrier.trim().startsWith("+")) };
+          });
+        }
+      }
+      if (!quotes) {
+        const detail = lastError instanceof Error ? lastError.message : String(lastError);
+        const failedRequest = payloadRequests[barrierContractIndex];
+        const failedBarrier = typeof failedRequest?.barrier === "string" ? failedRequest.barrier : "<none>";
+        throw new Error(failedRequest.contract + " (" + failedBarrier + "): " + detail);
+      }
+    } else {
+      try {
+        quotes = await session.quoteBundle(payloadRequests);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const failedRequest = payloadRequests.find((request) => request.contract !== "CALL" && request.contract !== "PUT") ?? payloadRequests[0];
+        const failedBarrier = typeof failedRequest?.barrier === "string" ? failedRequest.barrier : "<none>";
+        throw new Error(failedRequest.contract + " (" + failedBarrier + "): " + detail);
+      }
     }
     const ids = await Promise.all(quotes.map((quote, index) => session.buy(quote.id, quote.ask).then((contractId) => {
       activePhoenixIdsRef.current.add(contractId);

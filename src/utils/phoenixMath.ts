@@ -128,6 +128,26 @@ export function chooseImpulseDirection(spotMove: number, previousSpot: number, s
   return spot > previousSpot ? "LONG" : "SHORT";
 }
 
+export function decimalsFromLatestQuote(latestQuote: number): number {
+  if (!Number.isFinite(latestQuote) || latestQuote <= 0) return 2;
+  const fraction = String(latestQuote).split(".")[1];
+  const decimals = fraction ? fraction.length : 2;
+  return Math.max(2, Math.min(4, decimals));
+}
+
+export function pipSizeFromDecimals(decimals: number): number {
+  const safeDecimals = Math.max(2, Math.min(4, Math.round(decimals)));
+  return Number((10 ** -safeDecimals).toFixed(safeDecimals));
+}
+
+export function syntheticTouchOffset(atr15: number, pipSize: number, decimals: number, validatedOffset?: number): number {
+  const safeAtr = Number.isFinite(atr15) && atr15 > 0 ? atr15 : pipSize * 20;
+  const base = validatedOffset && validatedOffset > 0
+    ? validatedOffset
+    : Math.max(pipSize * 20, safeAtr * 1.8);
+  return Number(base.toFixed(Math.max(2, Math.min(4, decimals))));
+}
+
 export function cleanBarrierOffset(rawBarrier: string | number | null | undefined, decimals: number): number {
   const parsed = typeof rawBarrier === "number" ? rawBarrier : parseFloat(String(rawBarrier ?? "").replace(/[^0-9.+-]/g, ""));
   if (!Number.isFinite(parsed)) return 0;
